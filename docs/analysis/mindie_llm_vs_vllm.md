@@ -3,7 +3,9 @@
 > 文档版本：2026-05-11
 > 对照对象：
 > - **vLLM**：本仓库 `vllm-project/vllm`（V1 架构，主分支，对应 v0.9.x 之后版本）
-> - **MindIE LLM**：华为 MindIE 推理引擎中的 `mindie_llm/text_generator/` 模块（基于先前架构梳理）
+> - **MindIE LLM**：华为开源仓库 [`Ascend/MindIE-LLM`](https://github.com/Ascend/MindIE-LLM)（2025/12 开源，含 Python 包 `mindie_llm/` + C++ `src/`）
+>
+> 数据来源：直接阅读双方 GitHub 源码（vLLM 在本仓库工作目录、MindIE-LLM 在 `Ascend/MindIE-LLM` 主分支克隆）。本次更新由两个并行探索代理（C++ 侧 + Python 侧）+ 一次汇总分析整合得到，所有类名/文件路径均来自源码。
 >
 > 本文档面向：希望系统比较两者技术路线、判断在 NPU/GPU 部署 LLM 推理服务时如何选型、或希望从 vLLM 借鉴特性增强 MindIE LLM（反之亦然）的工程师与架构师。
 
@@ -43,12 +45,15 @@
 - **跨平台**：`vllm/platforms/` 提供 cuda/rocm/tpu/xpu/cpu，并通过 `vllm/plugins/` 接受 *out-of-tree platform plugin*（如 Ascend、Gaudi、Spyre）。
 - **一切皆配置**：`VllmConfig` 聚合 `model_config / cache_config / parallel_config / scheduler_config / speculative_config / lora_config / kv_transfer_config / structured_outputs_config / observability_config / ec_transfer_config / ...`，所有子系统 `__init__(vllm_config)` 即可拿到全局视图。
 
-### 2.2 MindIE LLM `text_generator`
-- **执行抽象层**：上层是 *Server / LLM Manager*（C++，负责服务化、调度、Block Manager、KV Connector，构造 batch 并以 `InputMetadata` 下发），下层是 *Modeling*（`model_wrapper/{atb,aclgraph}`，做算子编排和图模式执行）。
-- **`text_generator` 自身不做调度**：它接收已经组好 batch 的 `InputMetadata`，对外只负责 *preprocess → forward → sample → postprocess* 与 *PD 分离 / 加速插件 / 异常恢复*。
-- **强绑定 CANN/Ascend**：后端只有 `ATB`（昇腾算子图）、`ATB-Async`、`ACLGraph (Torch)`，没有跨硬件抽象层。
+### 2.2 MindIE LLM
+- **多进程混合栈**（基于 `Ascend/MindIE-LLM` 真实源码）：
+  - **入口**：`mindie_llm/server/main.py` 实际只 `os.execve` 拉起 C++ 二进制 `mindieservice_daemon`（`bin/mindieservice_daemon`）；
+  - **C++ 主进程**（`src/`）：`mindieservice_daemon` 内部组装 `LlmManager` / `LlmManagerV2`、`LlmEngine`、`Scheduler`、`BlockSpaceManager`、`IExecutor`，承担 HTTP/gRPC 服务、连续批调度、KV Block 管理、请求生命周期；
+  - **Python Worker 子进程**（`mindie_llm/connector/`）：每张 NPU 拉起一个 connector 进程，作为"推理 worker"，与 C++ 主进程通过 **POSIX 共享内存 + Protobuf**（`proto/model_execute_data.proto`）双向通信，内部由 `RequestRouter` → `RouterImpl` → `text_generator.Generator` 执行 forward/sample。
+- **`text_generator` 自身不做调度**：它接收已经组好 batch 的 `InputMetadata`，对外只负责 *preprocess → forward → sample → postprocess* 与 *PD 分离 / 加速插件 / 异常恢复*；调度由 C++ 的 `Scheduler` 完成。
+- **强绑定 CANN/Ascend**：后端只有 `ATB`（昇腾算子图，走外部包 `atb_llm`）、`ATB-Async`、`ACLGraph (Torch)`（走 `mindie_llm/runtime/`），没有跨硬件抽象层。
 
-> 这种边界差异决定了所有"调度类对比"实际上是 **vLLM 的 `Scheduler` ↔ MindIE Server 的 C++ scheduler**，而 `text_generator` 对应的是 vLLM 的 `Worker + ModelRunner + Sampler + Plugin` 这一段。后续章节我们会按对应关系展开。
+> 这种边界差异决定了所有"调度类对比"实际上是 **vLLM 的 `Scheduler`（Python） ↔ MindIE 的 `src/scheduler/Scheduler`（C++）**，而 `text_generator` 对应的是 vLLM 的 `Worker + ModelRunner + Sampler + Plugin` 这一段。后续章节按此对应关系展开。完整进程拓扑见 §10。
 
 ---
 
@@ -77,42 +82,74 @@ Client (OpenAI HTTP) ──► AsyncLLM ──► EngineCoreClient (ZMQ)
 
 **MindIE LLM**：
 
+**MindIE LLM**（基于 `Ascend/MindIE-LLM` GitHub 真实源码 + 子代理探索）：
+
 ```text
-Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
-                                          │  (打包 batch 为 InputMetadata)
-                                          ▼
-                              Generator.generate_token(InputMetadata)         (Python)
-                                  ├─ PD-Decoder: drain input_metadata_queue
-                                  └─ PluginManager.generate_token[_async]
-                                        ├─ preprocess
-                                        │     ├─ infer_context.get_batch_context_handles
-                                        │     ├─ splitfuse / 普通 compose_model_inputs
-                                        │     └─ structured_output bitmask
-                                        ├─ model_inputs_update_manager (plugins chain)
-                                        ├─ generator_backend.forward
-                                        │     └─ model_wrapper.forward (ATB / ACLGraph)
-                                        ├─ sample_preprocess_manager → backend.sample
-                                        │     └─ Sampler = LogitsHandlerList ∘ TokenSelector
-                                        └─ postprocess
-                                              ├─ plugin_verify_manager
-                                              ├─ output_filter.filter_finished_sequences
-                                              ├─ infer_context.update_context / fork_context
-                                              └─ plugin_cache_update / clear
+Client ──► mindieservice_daemon (C++ 进程, src/server/, src/llm_manager/)
+                │
+                │  LlmManagerImpl 取请求 → SeqGroupBuilderFromInferReq
+                │  → SequenceGroup → Scheduler::AddSeqGroup
+                ▼
+       LlmEngine::SchedulerThreadEntry  (每 DP 一条线程, EnginePerDP)
+            ├─ Scheduler::Schedule(needSync)
+            │    ├─ DecidePDPriority (PnD/Flex/P/D + chunked MIX)
+            │    ├─ SchedulingBudget(maxNumBatchedTokens, maxNumSeqs)
+            │    ├─ FcfsPolicy / LayerwiseFcfsPolicy / PDDSPolicy
+            │    ├─ BlockSpaceManager.{allocate, append, swap, fork}
+            │    └─ ConvertToSchedulerOutput → SequenceGroupMetaData
+            ├─ ConstructExecuteRequest → Protobuf (model_execute_data.proto)
+            └─ IExecutor::AsyncExecuteModel
+                 │
+                 │ IPCCommunicator(SharedMemory) + Protobuf
+                 ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ Python Worker Process (每 NPU 一个; mindie_llm/connector/)      │
+   │                                                                 │
+   │  RequestListener → SharedMemCommunication                       │
+   │      └─ receive_message: 4B little-endian len + Protobuf body   │
+   │  RequestRouter (inference / transfer / pdlink / command 队列)   │
+   │      └─ RouterImpl                                              │
+   │          ├─ MODEL_INIT  → Generator(model_config=...)           │
+   │          └─ MODEL_INFER → Generator.generate_token(InputMeta)   │
+   │                                                                 │
+   │  Generator.generate_token (text_generator/generator.py)         │
+   │      └─ PluginManager.generate_token[_async]                    │
+   │            ├─ preprocess (infer_context, splitfuse, bitmask)    │
+   │            ├─ model_inputs_update_manager (plugins chain)       │
+   │            ├─ generator_backend.forward                         │
+   │            │     └─ model_wrapper.forward                       │
+   │            │           ├─ ATBModelWrapper → atb_llm.ModelRunner │
+   │            │           └─ AclGraphModelWrapper → runtime.ModelRunner│
+   │            ├─ sample_preprocess_manager → backend.sample        │
+   │            │     └─ Sampler = LogitsHandlerList ∘ TokenSelector │
+   │            └─ postprocess (verify, output_filter, ctx update)   │
+   │                                                                 │
+   │  GenerationOutput → _mindie_llm_connector.convert_generate_output│
+   │      → Protobuf → SharedMemCommunication.send_*  → daemon       │
+   └─────────────────────────────────────────────────────────────────┘
 ```
+
+> 关键事实（GitHub 源码确认，详见 §10）：
+> - `mindie_llm/server/main.py` 只有 `os.execve` 拉起 C++ `mindieservice_daemon`，真正的 server 在 C++ 侧；
+> - C++ 主进程与 Python worker 之间靠 **POSIX 共享内存 + Protobuf**（`proto/model_execute_data.proto`），不是常见的 pybind 直调；
+> - `LlmManager v1`（pybind 暴露）与 `LlmManagerV2`（C++ 内部）共用 `LlmManagerImpl`，v1 是回调适配薄壳；
+> - `IExecutor` 强制 `deploy_type = INTER_PROCESS`，"独立 worker 进程"是架构刚性约束。
 
 **对照点**：
 
-| vLLM 角色 | MindIE LLM 对应角色 |
+| vLLM 角色 | MindIE LLM 对应角色（含真实类/路径） |
 | --- | --- |
-| `AsyncLLM` / `LLMEngine` | 上层 MindIE Server（C++） |
-| `EngineCore.step()` | `Generator.generate_token` + `PluginManager.generate_token` |
-| `Scheduler` | MindIE LLM Manager 的 C++ scheduler（不在 `text_generator` 里） |
-| `KVCacheManager` / `BlockPool` | MindIE 的 BlockManager（C++）+ `text_generator` 内 `BatchContext` / `kvcache_settings` 视图 |
-| `Executor` + `Worker` | `GeneratorBackend`（`GeneratorTorch / TorchAsync / AclGraph`） |
-| `GPUModelRunner` | `model_wrapper`（`atb` / `aclgraph`）+ `compose_model_inputs` |
-| `Sampler` (`v1/sample/sampler.py`) | `Sampler` + `LogitsHandlerList` + `TokenSelector` |
-| `Plugin`（轻量、聚焦于 LoRA/IO 处理等） | `Plugin` 流水线（重，承担推测解码/前缀缓存/splitfuse/结构化输出/MTP/LA 等） |
-| `KVConnectorFactory` + `kv_transfer/` | `PDInterface` + `SeparateDeploymentWorker` + `mempool/` |
+| `AsyncLLM` / `LLMEngine`（Python） | `mindieservice_daemon` + `LlmManager` / `LlmManagerV2` / `LlmManagerImpl`（C++，`src/llm_manager*/`） |
+| `EngineCore` + `EngineCore.step()` | `LlmEngine` + `EnginePerDP::SchedulerThreadEntry`（C++，`src/engine/llm_engine.cpp`） |
+| `Scheduler`（Python） | `Scheduler` + `FcfsPolicy / LayerwiseFcfsPolicy / PDDSPolicy`（C++，`src/scheduler/`） |
+| `KVCacheManager` + `BlockPool` | `BlockSpaceManager` / `SelfAttnBlockManager` + `PrefixCacheBlockAllocator` / `HashlessAllocator` / `LruEvictor`（C++，`src/block_manager/`） |
+| `Executor` + `Worker` | C++ `IExecutor` + IPC SHM/Protobuf  ⇄  Python `connector/main.py`（`mindie_llm/connector/`）+ `GeneratorBackend`（`text_generator/adapter/`） |
+| `GPUModelRunner` | ATB 路径：`atb_llm.runner.ModelRunner`（外部包）；ACLGraph 路径：`mindie_llm.runtime.model_runner.ModelRunner` |
+| `Sampler` (`v1/sample/sampler.py`) | `Sampler` + `LogitsHandlerList` + `TokenSelector`（`text_generator/samplers/`） |
+| `Plugin`（轻量、聚焦于 LoRA/IO 处理等） | `Plugin` 流水线（重，承担推测解码/前缀缓存/splitfuse/结构化输出/MTP/LA 等，`text_generator/plugins/`） |
+| `KVConnectorFactory` + `kv_transfer/` | C++ `KVTransferSchedulePolicy` + `Scheduler::ScheduleTransfer` + `IExecutor::ExecuteKVTransfer`；Python `PDInterface` + `SeparateDeploymentWorker` + `mempool/`（KvPool 走嵌入式 Python 调用） |
+| `MultiprocExecutor` 子进程 | "C++ daemon × N 个 Python connector worker" 进程组 + 共享内存 IPC |
+| `parallel_state.py`（`tp/pp/dp` group） | `mindie_llm/runtime/utils/distributed/parallel_info_manager.py` + `ParallelType` 枚举（含 ATTN_TP/DP/CP/INNER_SP, MOE_TP/EP/EP_MC2） |
 
 ### 3.2 进程/并发模型
 
@@ -140,16 +177,25 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
 - `update_from_output` 还要做：处理 `KVConnectorOutput`（远端 KV 拉取结果）、推测解码统计、停止条件、KV cache events。
 - 支持 `async_scheduling`、`AsyncScheduler` 子类。
 
-#### MindIE LLM
-- 调度本身在 *LLM Manager*（C++）侧，`text_generator` 拿到的是已组好 batch 的 `InputMetadata`，但执行层在 `PluginManager` 里仍要：
+#### MindIE LLM（C++ 调度器，源码：`src/scheduler/`）
+- 入口 `Scheduler::Schedule(bool needSync)`（`src/scheduler/scheduler.cpp`），核心步骤：
+  1. `DecidePDPriority(needSync)`：综合角色（`PnD / FlexPnD / FlexP / FlexD / P / D`）+ `enableChunkedPrefill` + 多 DP `PreScheduler::ShareSchedInfo` 决定本轮先 prefill 还是 decode（chunked prefill 走 `PDPriorityType::MIX`）。
+  2. 构造 `SchedulingBudget(maxNumBatchedTokens, maxNumSeqs)`（`src/include/dataclass/scheduling_budget.h`），与 vLLM 的 `token_budget` 等价；layerwise 时可置 0 跳过本轮。
+  3. **策略工厂** `policy_factory.cpp` 按角色挑策略：
+     - `PnD/FlexPnD/FlexP/FlexD` → `FcfsPolicy`（chunked 走 `FcfsPolicy::ScheduleChunkedPrefill`）；
+     - `LayerwiseDisaggregated` → `LayerwiseFcfsPolicy`；
+     - `P / D` 纯 PD 角色 → `PDDSPolicy`；
+     - Stage（先 prefill 还是 decode）由 `StagePolicyFactory` 选 `PrefillFirstPolicy / TptStagePolicy / LatencyStagePolicy / EdgeCloudPolicy`，Flex 角色固定 `TimeDivisionPolicy`。
+  4. `PolicyHelper::Preempt / SwapOut` 实现抢占（含 `PreemptionMode::SWAP / RECOMPUTE`），与 vLLM 的 priority/FCFS 抢占等价；但 *优先级策略类型在配置层尚未接通*（`prefillPolicyType != 0` 会抛错，未来可扩展）。
+  5. 输出 `SchedulerOutputs` + `SequenceGroupMetaDatas`，由 `ConstructExecuteRequest::ConstructExecuteModelRequest` 转 Protobuf 下发。
+- `text_generator` 拿到的是已组好 batch 的 `InputMetadata`，但执行层在 `PluginManager` 里仍要：
   - 按 `splitfuse` 决定 chunked prefill 的 q_lens / mask；
   - 按 `MTP / LA` 等推测插件改写 `q_len / mtp_model_inputs`；
-  - PD-Decoder 节点用 `input_metadata_queue` 把"已完成 KV 拉取"的请求出队再入流水线；
-- 没有显式的 `preempt` 概念，抢占由 LLM Manager + Block Manager 处理。
+  - PD-Decoder 节点用 `input_metadata_queue` 把"已完成 KV 拉取"的请求出队再入流水线。
 
 **对比要点**：
-- vLLM 把"调度 + KV + 抢占 + 多模态预算 + 推测预算 + LoRA + KV Connector" 集中在一个 `schedule()` 中，便于联合优化（例如把 prefix-cache hit 直接折入 chunked prefill 预算）。
-- MindIE LLM 选择"调度归 C++、执行归 Python"，**好处**是调度可以做高性能，**代价**是 `text_generator` 里需要通过插件二次修正 batch（splitfuse/MTP），跨语言协作链路更长。
+- vLLM 把"调度 + KV + 抢占 + 多模态预算 + 推测预算 + LoRA + KV Connector" 集中在一个 Python `schedule()` 中，便于联合优化（例如把 prefix-cache hit 直接折入 chunked prefill 预算）；
+- MindIE LLM "调度归 C++、执行归 Python"——`Scheduler` 是 C++ 类、跑在 `mindieservice_daemon` 里，与 worker 通过 Protobuf+SHM 解耦。**好处**：调度无 GIL、可做更激进的多 DP 同步（`PreScheduler::ShareSchedInfo`），且 PD/Flex 角色机制内建；**代价**：批结构需要在 worker 侧 `text_generator` 里通过插件二次修正（splitfuse/MTP），且新增调度特性要改 C++。
 
 ### 4.2 KV Cache / 前缀缓存 / KV Offload
 
@@ -162,18 +208,34 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
 - `vllm/distributed/kv_transfer/kv_connector/`：跨节点 KV 通道（NIXL、LMCache、Multi、SharedStorage、P2P、OffloadingConnector），用于 PD 分离、共享缓存。
 - `vllm/distributed/kv_events.py`：KV Cache 事件总线，可对接外部 cache。
 
-#### MindIE LLM
-- Block 管理在 LLM Manager（C++）；`text_generator` 通过 `infer_context.get_batch_context_handles` 拿"块视图"。
-- `prefix_cache_plugin`：核心数据结构是 C++ 前缀树（`cpp/prefix_tree`），由 plugin 控制何时 `put` / `wait_put_finish`。
-- `MemPoolType.{DISABLED, SYNC_WRITE, ASYNC_WRITE}`：决定 prefix_cache 是 *sample 后同步写* 还是 *preprocess 阶段异步写、postprocess 等待完成*。
-- `mempool/` 提供 `mooncake / memcache` 后端工厂，对应 Mooncake 这类外部 KV-Pool。
-- `block_copy.py` + `cpp/memory_bridge`：CPU↔NPU swap 与 Block Manager 协同。
+#### MindIE LLM（C++ Block 管理 + Python KvPool 桥接）
+- Block 管理主体在 C++（`src/block_manager/`）：
+  - 抽象接口 `BlockSpaceManager`（`src/include/block_manager/block_manager_interface.h`）；
+  - 主实现 `SelfAttnBlockManager`（`src/block_manager/self_attn_block_manager.cpp`），内部按 `enableCaching_` 选择两种分配器：
+    - `BlockAllocatorType::PREFIXCACHING` → `PrefixCacheBlockAllocator`（前缀缓存命中）；
+    - `BlockAllocatorType::HASHLESS` → `HashlessAllocator`（无缓存）；
+  - `LruEvictor`、`CpuNpuBlockAllocator`、`BlockTable` 配合实现 LRU 淘汰、CPU/NPU swap、并行采样 fork（copy-on-write）；
+  - 还有 `LwdSelfAttnBlockManager` 用于 layerwise 解耦。
+- **KvPool（外部 KV 池）**：当 `config.enableKvPool` 开启，C++ 在 `SelfAttnBlockManager` 构造时 **取 GIL 并嵌入式调用 Python**：
+  ```cpp
+  // self_attn_block_manager.cpp
+  py::object memPoolCls_ = py::module_::import("mindie_llm.text_generator.mempool")
+                              .attr("MemPool");
+  py::object memPool_ = memPoolCls_.attr("create_pool")(
+      config.cachePoolBackend, config.cachePoolConfigPath);
+  ```
+  即 *Python 的 `mempool/` 工厂（mooncake / memcache 等后端）被 C++ 反向调用*，是个少见但有效的模式。
+- `text_generator` 侧：
+  - `infer_context.get_batch_context_handles` 拿到 worker 视角的"块视图"；
+  - `prefix_cache_plugin`：核心数据结构是 C++ 前缀树（`text_generator/cpp/prefix_tree`，注意：与 `src/block_manager/` 的 `PrefixCacheBlockAllocator` 不是同一份代码，**两者关系未在公开源码中显式贯通**，可能是 plugin 侧的额外索引）；
+  - `MemPoolType.{DISABLED, SYNC_WRITE, ASYNC_WRITE}`：决定 prefix_cache 是 *sample 后同步写* 还是 *preprocess 阶段异步写、postprocess 等待完成*；
+  - `block_copy.py` + `cpp/memory_bridge`：CPU↔NPU swap 与 C++ Block Manager 协同。
 
 **对比要点**：
 
 | 特性 | vLLM | MindIE LLM |
 | --- | --- | --- |
-| 块管理位置 | Python `KVCacheManager`，与 Scheduler 强耦合 | C++ Block Manager，`text_generator` 只看视图 |
+| 块管理位置 | Python `KVCacheManager`，与 Scheduler 强耦合 | C++ `SelfAttnBlockManager`，与 `Scheduler` 强耦合，`text_generator` 只看视图 |
 | 前缀缓存 | Hash + Block，调度层零开销命中 | C++ 前缀树，独立 Plugin |
 | 异步写回 | 由 `KVConnector` 统一抽象 | `MemPoolType.ASYNC_WRITE` 在 Plugin 内显式两段式 |
 | 跨节点 KV | `KVConnector` 多实现（NIXL 等） | Mooncake / memcache 后端工厂 |
@@ -188,10 +250,14 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
 - Attention backend 有完整工厂：`flash_attn / flashinfer / triton_attn / flex_attention / pallas / cpu_attn / rocm_aiter_fa / mla / mamba / linear / gdn / short_conv / tree`，可按硬件/模型/策略动态选择。
 
 #### MindIE LLM
-- `GeneratorBackend` 基类 + 三个子类（`GeneratorTorch / TorchAsync / AclGraph`），每个子类对应一种 ATB / Torch+ACLGraph 配置；通过 `get_generator_backend(model_config)` 工厂选择。
-- 模型加载经 `get_model_wrapper(model_config, backend_type)`，模型本身存活在 `mindie_llm/modeling/model_wrapper/`，与 `text_generator` 解耦。
-- 没有 vLLM 这种"按平台多 Worker"的体系，因为只服务 NPU；并行细节由底层 ATB / HCCL 提供。
-- Attention backend 由 ATB 内部实现，不在 Python 层暴露多种选择。
+- "Worker" 不是单个 Python 类，而是一个 **完整的 connector 子进程**：`mindie_llm/connector/main.py` 由 C++ daemon 拉起，内部 `RequestListener → SharedMemCommunication → RequestRouter → RouterImpl` 这条链路才相当于 vLLM 的 `WorkerWrapperBase + Worker`。
+- 推理执行抽象 `GeneratorBackend` 基类 + 三个子类（`GeneratorTorch / TorchAsync / AclGraph`），每个子类对应一种 ATB / Torch+ACLGraph 配置；通过 `get_generator_backend(model_config)` 工厂选择。
+- 模型加载分两条路径：
+  - **ATB 路径**：`ATBModelWrapper`（`modeling/model_wrapper/atb/`）委托 **外部包** `atb_llm.runner.model_runner.ModelRunner`，并行映射 `mapping`（含 `attn_dp / attn_inner_sp / attn_cp / moe_tp / moe_ep`）由 `atb_llm` 注入；
+  - **ACLGraph (Torch) 路径**：`AclGraphModelWrapper`（`modeling/model_wrapper/aclgraph/`）委托 **包内** `mindie_llm.runtime.model_runner.ModelRunner`，配合 `runtime/compilation/aclgraph_backend.py` 做 ACL Graph 捕获。
+- 算子注册：`mindie_llm/runtime/ops/mie_ops/__init__.py` 在 import 时按 NPU 型号 `importlib.import_module("mie_ops_ascend910b" | "mie_ops_ascend910_93")`，相当于 vLLM 的 platform plugin。
+- 没有 vLLM 这种"按平台多 Worker"的体系，因为只服务 NPU；并行细节由底层 ATB（HCCL）提供，Python 层 `runtime/utils/distributed/__init__.py::init_distributed` 仅在 ACLGraph 路径显式 `dist.init_process_group(backend="hccl")`。
+- Attention backend 由 ATB / ACLGraph 内部实现，不在 Python 层暴露多种选择（与 vLLM 的 flash_attn / flashinfer / triton_attn / mla / mamba 工厂矩阵形成对比）。
 
 **对比要点**：
 - vLLM 的 *Backend × ModelRunner × Attention Backend* 是一个三维矩阵，每一维都有插件化选项，支持很广 —— 灵活性高，但代码量大、认知复杂度高（`gpu_model_runner.py` 5300 行）。
@@ -259,12 +325,19 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
   - `Executor.init_kv_output_aggregator(connector)` 统一聚合 worker 端 KV xfer 结果。
 - 多 Engine（多 EngineCore 子进程）天然适合 P/D 拆分部署。
 
-#### MindIE LLM
-- `PDInterface` 是顶层接口：`Generator` 直接继承，暴露 `link / unlink / unlink_batch / query_link_status / switch_role / pull_kv` 等动作；
-- `SeparateDeploymentWorker` 封装 PD worker；
-- Decoder 节点通过 `input_metadata_queue` 把 *已经拉到 KV* 的请求转入主流水线，避免阻塞主迭代；
-- 角色 (`pd_role`) 通过 `parse_config` 一次性下发，会反向影响：是否启用 prefix_cache（Decoder 节点禁用）、`warm_up` 走哪条路径等。
-- 跨节点 KV 介质走 `mempool/`（mooncake / memcache）。
+#### MindIE LLM（C++ 调度 + Python 执行 + KvPool 嵌入式）
+- **C++ 侧**：
+  - `Role::P / D / PnD / FlexP / FlexD / FlexPnD`（`src/include/dataclass/role.h`）渗透到调度策略与 stage 选择；
+  - `Scheduler` 维护 `transferringMap_`，并由 `KVTransferSchedulePolicy` + `Scheduler::ScheduleTransfer()` 单独调度 *KV pull / 释放* 路径；
+  - `IExecutor::ExecuteKVTransfer` 将 KV 拉取下发到 worker；
+  - `LlmManagerV2::QueryPDLinkStatus / UpdateFlexSwitchInfo / HandleLora` 等控制 API 暴露给上层服务管理 PD 链路状态机。
+- **Python 侧**：
+  - `PDInterface`：`Generator` 直接继承，暴露 `link / unlink / unlink_batch / query_link_status / switch_role / pull_kv`；
+  - `SeparateDeploymentWorker` 封装 PD worker；
+  - Decoder 节点通过 `input_metadata_queue` 把 *已经拉到 KV* 的请求转入主流水线，避免阻塞主迭代；
+  - 角色 (`pd_role`) 通过 `parse_config` 一次性下发，会反向影响：是否启用 prefix_cache（Decoder 节点禁用）、`warm_up` 走哪条路径等；
+  - `mindie_llm/distributed/kv_transfer/kv_transfer_agent.py` 在公开版本里基本是空壳——KV 传输的实质工作主要在 C++（`IExecutor::ExecuteKVTransfer`）+ KvPool（mempool）共同完成。
+- 跨节点 KV 介质走 `mempool/`（mooncake / memcache），由 C++ 通过嵌入式 Python 调用（详见 §4.2）。
 
 **对比要点**：
 - MindIE LLM 把 PD 分离做成了"**架构内置**"，使得"角色驱动配置"很自然（FLEX/PREFILL/DECODER 走不同 warmup 路径）。
@@ -412,7 +485,7 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
 
 ## 9. 参考与延伸阅读
 
-- vLLM 关键源码（本仓库）：
+### 9.1 vLLM 关键源码（本仓库）：
   - `vllm/v1/engine/llm_engine.py`：顶层 `LLMEngine`
   - `vllm/v1/engine/core.py`：`EngineCore` 与 `step / step_with_batch_queue`
   - `vllm/v1/core/sched/scheduler.py`：调度器主体
@@ -424,7 +497,14 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
   - `vllm/distributed/kv_transfer/kv_connector/`：KV 跨节点
   - `vllm/v1/structured_output/`：结构化输出
   - `vllm/entrypoints/openai/`：OpenAI 兼容 API
-- MindIE LLM 关键源码（外部仓库）：
+### 9.2 MindIE LLM 关键源码（[`Ascend/MindIE-LLM`](https://github.com/Ascend/MindIE-LLM)）：
+
+#### Python 侧（`mindie_llm/`）
+  - `mindie_llm/server/main.py`：壳入口（`os.execve` 拉起 C++ daemon）
+  - `mindie_llm/connector/main.py`：Python worker 进程入口
+  - `mindie_llm/connector/request_listener/shared_mem_communication.py`：与 C++ 的共享内存 + Protobuf 通信
+  - `mindie_llm/connector/request_router/{request_router.py, router_impl.py}`：请求路由与执行
+  - `mindie_llm/connector/cpp/parallel_convert.cpp`：pybind 扩展 `_mindie_llm_connector`，加速 `GenerationOutput` → Protobuf
   - `mindie_llm/text_generator/generator.py`：`Generator` + `PDInterface` + warm_up
   - `mindie_llm/text_generator/plugins/plugin_manager.py`：`PluginManager` 主流水线
   - `mindie_llm/text_generator/adapter/`：`GeneratorBackend` 三个后端
@@ -432,11 +512,167 @@ Client ──► MindIE Server (C++) ──► LLM Manager / Scheduler (C++)
   - `mindie_llm/text_generator/utils/tg_infer_context_store.py`：`TGInferContextStore`
   - `mindie_llm/text_generator/cpp/`：C++ 加速（CPU sampler / prefix tree / memory bridge）
   - `mindie_llm/text_generator/mempool/`：KV-Pool 后端工厂（mooncake / memcache）
-- 文档：
+  - `mindie_llm/modeling/model_wrapper/{atb,aclgraph}/`：模型 wrapper（注意与顶层 `model_wrapper/utils/` 命名空间不同）
+  - `mindie_llm/runtime/model_runner/model_runner.py`：ACLGraph 路径模型运行时
+  - `mindie_llm/runtime/utils/distributed/{__init__.py, parallel_info_manager.py}`：HCCL 初始化 + `ParallelType`
+  - `mindie_llm/runtime/ops/mie_ops/__init__.py`：按 NPU 型号动态加载算子库
+  - `mindie_llm/runtime/lora/lora_manager.py`：LoRA adapter 管理
+
+#### C++ 侧（`src/`）
+  - `src/llm_manager/llm_manager.{h,cpp}`：v1 `LlmManager`（pybind 暴露）
+  - `src/llm_manager_v2/llm_manager.cpp` + `src/llm_manager_v2/include/impl/llm_manager_impl.{h,cpp}`：v2 + 共享 `LlmManagerImpl`
+  - `src/llm_manager/python_api/python_api_init.cpp`：pybind 模块 `llm_manager_python`
+  - `src/engine/llm_engine.{h,cpp}`：`LlmEngine` + `EnginePerDP::SchedulerThreadEntry`
+  - `src/engine/construct_execute_request.{h,cpp}`：`SequenceGroupMetaData` → Protobuf
+  - `src/scheduler/scheduler.{h,cpp}` + `src/scheduler/policy/{fcfs_policy.cpp, layerwise_fcfs_policy.cpp, pdds_policy.cpp, policy_factory.cpp}`：调度核心
+  - `src/include/dataclass/scheduling_budget.h`：`SchedulingBudget`
+  - `src/block_manager/self_attn_block_manager.{h,cpp}` + `src/include/block_manager/block_manager_interface.h`：KV Block 管理
+  - `src/include/utils/mem_pool.h`：KvPool C++ 包装（嵌入式 Python `MemPool`）
+  - `src/executor/{executor.cpp, ipc_communicator.{h,cpp}, grpc_communicator.{h,cpp}}` + `src/include/executor/executor_interface.h`：与 worker 的 IPC
+  - `src/include/dataclass/{sequence.h, sequence_group.h}` + `src/sequence/sequence.cpp`：状态机
+  - `src/server/`：HTTP/gRPC 服务装配（`mindieservice_daemon` 主进程）
+  - `proto/model_execute_data.proto`：跨语言协议
+
+### 9.3 文档与社区：
   - vLLM 官方文档：<https://docs.vllm.ai>
   - vLLM V1 Alpha Blog：<https://blog.vllm.ai/2025/01/27/v1-alpha-release.html>
-  - MindIE 官方文档：<https://www.hiascend.com/document/detail/zh/mindie/>（按版本）
+  - MindIE-LLM GitHub：<https://github.com/Ascend/MindIE-LLM>
+  - MindIE-LLM 文档站：<https://mindie-llm-doc.readthedocs.io/zh-cn/latest/>
+  - 昇腾 MindIE 官方文档：<https://www.hiascend.com/document/detail/zh/mindie/>（按版本）
+
+---
+
+## 10. 附录：MindIE-LLM 完整工程结构（基于 GitHub 源码）
+
+> 本节是对 §1–9 的"实证补充"。本次分析直接克隆并阅读了 [`Ascend/MindIE-LLM`](https://github.com/Ascend/MindIE-LLM) 主分支源码，由两个并行探索代理（C++ 侧 + Python 侧）输出后汇总。这里集中展示从源码读出的关键事实，用于校准前文各小节的对比。
+
+### 10.1 进程拓扑与部署模型
+
+MindIE-LLM 在生产部署中是 *"1 个 C++ daemon + N 个 Python worker"* 的多进程模型（与 vLLM 的 "1 个 LLMEngine + N 个 Worker 子进程" 形式相似，但角色与通信机制不同）：
+
+```text
+                          ┌──────────────────────────┐
+   $ python -m mindie_llm.server.main                │
+            │  (os.execve, 进程被替换)                 │
+            ▼                                         │
+   mindieservice_daemon (C++ 主进程)                  │
+   ├── HTTP/gRPC server (src/server/)                 │
+   ├── LlmManager / LlmManagerV2 / LlmManagerImpl     │
+   ├── LlmEngine                                      │
+   │     └── EnginePerDP × N        ← 每 DP 一条      │
+   │           ├─ Scheduler (含 FcfsPolicy 等)        │
+   │           ├─ BlockSpaceManager (KV)              │
+   │           └─ IExecutor                           │
+   │                 │                                │
+   │                 │ Protobuf + IPC 共享内存         │
+   │                 ▼                                │
+   ├── ConfigManager (单例)                           │
+   └── KvPool 桥（嵌入式 Python，import mempool）      │
+                                                     │
+   Python Worker × N (mindie_llm/connector/main.py)  │
+   └── 每张 NPU 一个进程                              │
+       ├── RequestListener                           │
+       ├── SharedMemCommunication                    │
+       │     (4B little-endian len + Protobuf body)  │
+       ├── RequestRouter (4 个并发队列)              │
+       │     ├─ inference_queue                      │
+       │     ├─ transfer_queue (PD)                  │
+       │     ├─ pdlink_queue                         │
+       │     └─ command_queue                        │
+       └── RouterImpl                                │
+            ├── MODEL_INIT  → Generator(...)         │
+            └── MODEL_INFER → Generator.generate_token
+                              └─ PluginManager → ModelWrapper → ATB / ACLGraph
+```
+
+**与 vLLM 对照**：
+- vLLM `MultiprocExecutor` 拉起的是 *"无名 Worker"*，主要用 ZMQ + msgspec；
+- MindIE 则是 *"有名 connector worker"*——每个 worker 有完整的入口、4 个独立请求队列与状态机，能对 PD/recover/lora 等控制面做细粒度处理。
+
+### 10.2 跨语言边界（Python ↔ C++）的三种机制
+
+| 机制 | 走向 | 用途 | 路径 |
+| --- | --- | --- | --- |
+| **pybind11 模块** `llm_manager_python` | Python → C++ | 暴露 v1 `LlmManager`、`InferRequest`、`Status` 等给 Python 调用方 | `src/llm_manager/python_api/python_api_init.cpp` |
+| **Protobuf + POSIX 共享内存 + 信号量** | C++ ⇄ Python worker | 推理请求 / 响应主路径（高频、跨进程） | `proto/model_execute_data.proto` + `src/executor/ipc_communicator.{h,cpp}` + `mindie_llm/connector/request_listener/shared_mem_communication.py` |
+| **嵌入式 Python**（C++ 持有 GIL 并 `py::module_::import`） | C++ → Python | KvPool 后端（mooncake / memcache），由 C++ Block Manager 反向调用 Python `mempool.MemPool` | `src/block_manager/self_attn_block_manager.cpp` + `src/include/utils/mem_pool.h` + `mindie_llm/text_generator/mempool/` |
+| **pybind11 反向加速** `_mindie_llm_connector` | Python → C++ | 把 `GenerationOutput` 高速序列化为 Protobuf（响应路径） | `mindie_llm/connector/cpp/parallel_convert.cpp` |
+
+**协议详细**：
+- 共享内存通道分 4 种：`execute / shared_sync_link / transfer / recover_command`，每个通道有独立的 *request* + *response* 两块共享内存；
+- 消息布局：`[4B little-endian length][protobuf payload...]`，buffer 默认 32MB；
+- `ExecuteType` 枚举：`MODEL_INIT / MODEL_INFER / KV_TRANSFER / CONTROL / ...`；
+- `ForwardType` 含 `MIXED`、`DUMMY`（warmup）等。
+
+**对比 vLLM**：vLLM V1 在主进程↔EngineCore 子进程之间用 ZMQ + msgspec（CPython 字节码序列化），延迟更低但二进制兼容性弱于 Protobuf；MindIE 选择 Protobuf 主要为了 **跨语言/跨节点稳定 ABI** + 与昇腾内部 C++ 工具链统一。
+
+### 10.3 调度器深度对照（vLLM `Scheduler` ↔ MindIE `Scheduler`）
+
+| 维度 | vLLM `Scheduler`（Python） | MindIE `Scheduler`（C++） |
+| --- | --- | --- |
+| 入口 | `Scheduler.schedule()` → `SchedulerOutput` | `Scheduler::Schedule(needSync)` → `SchedulerOutputs + SequenceGroupMetaDatas` |
+| 队列 | `running` (list) + `waiting` (`RequestQueue`，FCFS/PRIORITY) | `waiting_ / running_ / swapped_ + transferringMap_` |
+| 预算 | `token_budget = max_num_batched_tokens` + `max_num_running_reqs` | `SchedulingBudget(maxNumBatchedTokens, maxNumSeqs)` |
+| 抢占 | `SchedulingPolicy.PRIORITY` 选最低优先级，否则 FCFS pop 队尾 | `PolicyHelper::Preempt / SwapOut`，`PreemptionMode::SWAP / RECOMPUTE` |
+| 角色 | 无（单一通用调度） | `Role::P / D / PnD / FlexP / FlexD / FlexPnD` 决定策略矩阵 |
+| 策略 | 单一调度算法（chunked prefill 内置） | `FcfsPolicy / LayerwiseFcfsPolicy / PDDSPolicy / KVTransferSchedulePolicy` 工厂 + Stage 策略 (`PrefillFirstPolicy / TptStagePolicy / LatencyStagePolicy / EdgeCloudPolicy / TimeDivisionPolicy`) |
+| 多 DP 协同 | DP 由 `dp_group` + `has_unfinished_dp` 协调 | `PreScheduler::ShareSchedInfo` 跨 DP 共享 `SchedulerMetric` 后再决策 PD 优先级 |
+| Chunked prefill | `long_prefill_token_threshold` + budget 拆分 | `enableChunkedPrefill` → `PDPriorityType::MIX` → `FcfsPolicy::ScheduleChunkedPrefill` |
+| KV transfer 路径 | 与主 schedule 合并 | 单独 `Scheduler::ScheduleTransfer()` + `KVTransferSchedulePolicy` |
+| 输出形式 | Python dataclass `SchedulerOutput` | C++ 对象 → Protobuf `ExecuteRequest` 跨进程下发 |
+
+### 10.4 KV / Block Manager 深度对照
+
+| 维度 | vLLM | MindIE |
+| --- | --- | --- |
+| 主类 | `KVCacheManager` + `BlockPool` + `KVCacheCoordinator` | `BlockSpaceManager` (interface) → `SelfAttnBlockManager`、`LwdSelfAttnBlockManager` |
+| 分配器 | 内置 hash + free pool（`KVCacheBlock`） | `PrefixCacheBlockAllocator` / `HashlessAllocator`（按 `enableCaching_` 切换） |
+| 淘汰策略 | 基于 ref count 的隐式 LRU | 显式 `LruEvictor` |
+| Swap | `Scheduler` 抢占触发 free，远端用 `KVConnector` | `CanSwapIn/Out + SwapIn/Out` (CPU↔NPU)，`CpuNpuBlockAllocator` |
+| Hybrid KV | `single_type_kv_cache_manager` + `KVCacheCoordinator`（Mamba/Linear/Conv 多类型） | 未在公开源码中直接体现混合层 KV cache 抽象 |
+| 外部 KV 池 | `KVConnector` 多实现（NIXL / LMCache / SharedStorage / P2P / OffloadingConnector） | `enableKvPool` → C++ 嵌入式调用 Python `mempool.MemPool.create_pool(backend, config)` |
+| 前缀缓存 | `enable_prefix_caching` + `BlockHash` + `prefix_caching_hash_algo`，调度层零开销命中 | C++ `PrefixCacheBlockAllocator` 直接命中；同时 `text_generator/cpp/prefix_tree`（独立 plugin 索引） |
+| 并行采样 fork | `fork` 复用 KVCacheBlocks | C++ `BlockSpaceManager.fork`（copy-on-write） |
+| KV 事件 | `kv_events.py` + `EventPublisherFactory` | 未在公开源码中发现等价的事件总线 |
+
+### 10.5 并行 / 分布式
+
+vLLM `vllm/distributed/parallel_state.py` vs MindIE `mindie_llm/runtime/utils/distributed/parallel_info_manager.py`：
+
+| 并行维度 | vLLM | MindIE `ParallelType` 枚举 |
+| --- | --- | --- |
+| 全局 world | `world_group` | `WORLD` |
+| Tensor Parallel | `tp_group` | `ATTN_TP` + `MLP_TP` + `ATTN_O_PROJ_TP` + `WORLD_EMBED_TP` + `LM_HEAD_TP`（更细粒度） |
+| Data Parallel | `dp_group` | `ATTN_DP` |
+| Context / Sequence | `pcp_group` / `dcp_group`（PCP / DCP）+ SP | `ATTN_CP`、`ATTN_INNER_SP` |
+| Pipeline | `pp_group` | 由 ATB 内部并行映射处理（Python 层未显式枚举 PP group） |
+| Expert | `ep_group` | `MOE_TP`、`MOE_EP`、`MOE_EP_MC2`（专门的 MC2 通信优化路径） |
+| 通信后端 | `nccl / gloo / pynccl / tpu_distributed_utils` | `hccl`（昇腾） + 可选 `gloo` CPU 组 |
+| 通信原语 | `vllm/distributed/communication_op.py` | `runtime/utils/distributed/communication_op.py`（如 `allgather_and_reorder`） |
+| Buffer 调优 | NCCL env / `set_custom_all_reduce` | `hccl_buffer_size` 通过 `ProcessGroup.options.hccl_config` 设置 |
+
+**关键差异**：MindIE 把 *attention TP* 拆得更细（`ATTN_O_PROJ_TP`、`WORLD_EMBED_TP`、`LM_HEAD_TP` 是单独的并行组），便于针对昇腾的 HCCL 拓扑做更精细的通信调度；MoE 还有 `MOE_EP_MC2` 专门走 *MC2*（昇腾的多流并发）路径。vLLM 在 V1 中对 EP/SP/CP 的支持也在快速迭代，但当前粒度更粗。
+
+### 10.6 模型加载与算子注册
+
+| 项 | vLLM | MindIE |
+| --- | --- | --- |
+| 模型库 | `vllm/model_executor/models/`（~200 个） | `mindie_llm/runtime/models/` + 外部 `atb_llm` 包；显式包内列出 `qwen3 / deepseek_v3 / ...` |
+| 模型工厂 | `vllm/model_executor/model_loader/` + `vllm/model_executor/models/registry` | `runtime/models/base/router.py::get_router_ins` |
+| 算子加载 | 编译期：CUDA / triton / custom_op；运行时通过 `vllm/_custom_ops.py` 等 | 运行时按 NPU 型号 `importlib.import_module(mie_ops_ascend910b | mie_ops_ascend910_93)` |
+| LoRA | `vllm/lora/`，`punica_wrapper`，`worker_manager`；调度层有 `scheduled_loras` 上限 | `mindie_llm/runtime/lora/lora_manager.py`，通过 `RouterImpl.process_lora_operation` → `Generator.load_lora/unload_lora` 控制 |
+| 量化 | GPTQ / AWQ / AutoRound / FP8 / INT4 / INT8 等内置 | 由 `atb_llm` / 模型本身处理（公开仓库未直接展示量化工厂） |
+
+### 10.7 5 个最值得记住的"GitHub 源码事实"
+
+1. **MindIE 的 server 入口是个壳**：`mindie_llm/server/main.py` 唯一作用是 `os.execve('bin/mindieservice_daemon', ...)`，所有服务端逻辑（HTTP/gRPC、调度、Block 管理、请求生命周期）都在 C++。
+2. **C++ 与 Python worker 用 Protobuf + 共享内存**：不是 pybind 直调，而是带 4B 长度前缀的二进制消息走 POSIX SHM；调度域和执行域因此被进程隔离开，与 vLLM 的 `EngineCore` 子进程 + ZMQ 是同一思想的"昇腾 + Protobuf"版本。
+3. **`LlmManager v1` 与 `LlmManagerV2` 共用 `LlmManagerImpl`**：v1 仅做回调适配，v2 暴露更多控制 API（PD link 状态、LoRA、Flex 切换、Engine ready 探测）；想看真实行为必须读 Impl，不要被 v1 表面 API 误导。
+4. **KvPool 走"反向嵌入式 Python"**：C++ Block Manager 主动 `import mindie_llm.text_generator.mempool.MemPool`，把 KV 池后端（mooncake/memcache）当作 Python 插件——这与 vLLM 的"Python `KVConnector` 调 C++ 库"方向完全相反，是个少见但合理的设计。
+5. **Python connector 是真正的 worker**：每张 NPU 一个进程，4 个独立队列（inference / transfer / pdlink / command）让控制面与数据面在 Python 侧也保持解耦；其内部的 `Generator` 才是 `text_generator` 的入口——**所以 `text_generator` 不能脱离 connector + daemon 单独跑**，离线 demo 必须用 `mindie_llm/examples/run_generator.py` 这种自构造路径。
 
 ---
 
 > 本文档聚焦"架构 + 工程实现"层面的对比，不涉及具体性能 benchmark。性能数据高度依赖硬件（H100/H200/910B）、模型（Llama/Mixtral/DeepSeek）与负载分布（短/长上下文、PD 比例、并发数），建议在自身环境上做对照测试。
+>
+> 如需进一步对比某个子系统（例如 Sampler 的 PTA selector 与 vLLM `TopKTopPSampler`、或 spec decoding 的 plugin 矩阵 vs `v1/spec_decode/` 子系统），可以单独再发起对照分析。
