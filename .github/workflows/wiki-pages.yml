@@ -1,0 +1,71 @@
+# Deploy the vLLM Chinese Wiki (wiki/) to GitHub Pages.
+#
+# Setup (one-time, in the fork repo):
+#   1. Settings → Pages → "Build and deployment" → Source = "GitHub Actions".
+#   2. Settings → Environments → "github-pages" → "Deployment branches and tags":
+#      add `cursor/llm-wiki-a6e3` (for staging) AND keep `main` (for production),
+#      OR set to "All branches" while testing.
+#
+# After setup, this workflow publishes the wiki on every push that touches
+# wiki/**, and can also be triggered manually via "Run workflow".
+name: Deploy Wiki to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - cursor/llm-wiki-a6e3
+    paths:
+      - "wiki/**"
+      - ".github/workflows/wiki-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one in-flight Pages deployment; newer runs cancel earlier ones.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show wiki tree
+        run: |
+          echo "wiki/ contents:"
+          find wiki -maxdepth 2 -type f | sort
+          echo
+          echo "Total HTML files: $(find wiki -name '*.html' | wc -l)"
+
+      - name: Ensure .nojekyll exists
+        run: |
+          touch wiki/.nojekyll
+          ls -la wiki/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: wiki
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
