@@ -50,14 +50,12 @@ jobs:
           touch wiki/.nojekyll
           ls -la wiki/.nojekyll
 
+      # NOTE: Pages must be enabled once by hand in repo Settings (see
+      # wiki/README.md). The default `GITHUB_TOKEN` can WRITE to an existing
+      # Pages site, but cannot CREATE one — that's a repo-admin action and
+      # the integration token does not have that scope.
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          # First-run bootstrap: enable Pages (Source = GitHub Actions) if it
-          # has never been enabled. After the first successful run this is a
-          # no-op. Requires the workflow's `pages: write` permission (set
-          # above), no manual Settings click needed.
-          enablement: true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

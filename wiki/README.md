@@ -34,19 +34,33 @@ python3 -m http.server 8000 -d .
 
 ## 在 GitHub Pages 上发布
 
-仓库已自带一个 workflow：`.github/workflows/wiki-pages.yml`。
-它使用 `actions/configure-pages@v5` 的 `enablement: true` 在首次运行时
-**自动启用 Pages**（Source 自动设为 GitHub Actions），无需手动点 Settings。
+仓库已自带 workflow：`.github/workflows/wiki-pages.yml`。
+**首次启用必须由仓库管理员在 Settings 中手动操作一次**（GitHub 不允许
+Actions 的 `GITHUB_TOKEN` 自动创建 Pages 站点）：
 
-唯一可能需要你手动调一次的地方：
-**Settings → Environments → `github-pages` → "Deployment branches and tags"**
+### Step 1 · 启用 Pages（必做一次）
 
-- 默认仅允许从默认分支（`main`）部署；
-- 如果想在合并前先用本分支（`cursor/llm-wiki-a6e3`）预览，把它加进允许列表，
-  或临时选 "All branches"。
+- **Settings → Pages → "Build and deployment"**：
+  - Source = **GitHub Actions**
 
-之后只要修改 `wiki/**` 下任何文件并推送到允许的分支，
-Action 就会自动把整个 `wiki/` 部署到 Pages。
+### Step 2 · 允许从本分支部署（仅"先在本分支预览"才需要）
+
+默认只允许从 default branch（通常是 `main`）部署到 Pages 环境。
+要在合并前用 `cursor/llm-wiki-a6e3` 预览：
+
+- **Settings → Environments → `github-pages` → "Deployment branches and tags"**：
+  - 添加 `cursor/llm-wiki-a6e3`，或临时选 **"All branches"**。
+
+### Step 3 · 触发部署
+
+完成上面两步后，**重新触发** workflow：
+
+- 任意推送一个会改 `wiki/**` 的提交，或
+- 进 Actions 页 → "Deploy Wiki to GitHub Pages" → **Run workflow**。
+
+Action 跑完后，部署 URL 在 workflow run 的 `deploy` job 输出里，模板为
+`https://<owner>.github.io/<repo>/`，例如 fork 在 `Lyr-GW/vllm` 时
+URL 是 `https://lyr-gw.github.io/vllm/`。
 
 - 站点 URL 模板：`https://<owner>.github.io/<repo>/`
   - 例如 fork 在 `Lyr-GW/vllm`，URL 即 `https://lyr-gw.github.io/vllm/`。
