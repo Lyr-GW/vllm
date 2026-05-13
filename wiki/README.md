@@ -35,16 +35,17 @@ python3 -m http.server 8000 -d .
 ## 在 GitHub Pages 上发布
 
 仓库已自带一个 workflow：`.github/workflows/wiki-pages.yml`。
-**首次启用需在仓库 Settings 里做两步配置**（只需做一次）：
+它使用 `actions/configure-pages@v5` 的 `enablement: true` 在首次运行时
+**自动启用 Pages**（Source 自动设为 GitHub Actions），无需手动点 Settings。
 
-1. **Settings → Pages**：
-   - "Build and deployment" → **Source** = `GitHub Actions`。
+唯一可能需要你手动调一次的地方：
+**Settings → Environments → `github-pages` → "Deployment branches and tags"**
 
-2. **Settings → Environments → `github-pages` → "Deployment branches and tags"**：
-   - 添加 `main`（线上）；
-   - 想在合并前先用本分支预览，再加入 `cursor/llm-wiki-a6e3`（或临时选 "All branches"）。
+- 默认仅允许从默认分支（`main`）部署；
+- 如果想在合并前先用本分支（`cursor/llm-wiki-a6e3`）预览，把它加进允许列表，
+  或临时选 "All branches"。
 
-之后只要修改 `wiki/**` 下任何文件并推送到上述允许的分支，
+之后只要修改 `wiki/**` 下任何文件并推送到允许的分支，
 Action 就会自动把整个 `wiki/` 部署到 Pages。
 
 - 站点 URL 模板：`https://<owner>.github.io/<repo>/`

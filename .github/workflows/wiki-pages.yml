@@ -52,6 +52,12 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # First-run bootstrap: enable Pages (Source = GitHub Actions) if it
+          # has never been enabled. After the first successful run this is a
+          # no-op. Requires the workflow's `pages: write` permission (set
+          # above), no manual Settings click needed.
+          enablement: true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
