@@ -25,88 +25,370 @@
       <article>
 
 <h1>投机解码</h1>
-<p class="page-meta"><span>🚀 关键特性 · 11/22</span></p>
+<p class="page-meta"><span>🚀 关键特性 · 11/22</span><span>· 深入阅读约 15 分钟</span></p>
 
-<h2>动机</h2>
-<p>Decode 阶段是<strong>memory-bound</strong>：每生成一个 token 都得把整模型权重从 HBM 搬到 SRAM。
-如果能"一次性生成多个 token"，单步收益就成倍提升。投机解码（Speculative Decoding）就是干这件事：
-让一个<strong>便宜的 draft 模型</strong>预测后 N 个 token，然后让目标大模型一次性<strong>批量验证</strong>。</p>
+<p>本页的主线是<strong>算存比（arithmetic intensity, AI）</strong>：
+Decode 慢的根因是 LLM 在自回归阶段算存比极低，GPU 算力闲置而带宽打满；
+投机解码（Speculative Decoding, SD）本质上是<strong>把闲置的算力换成更多的 token</strong>，
+从而把单步推理推近 roofline 拐点。理解了这一点，就理解了从原始 SD 到 EAGLE-3 / Tree-Attention
+所有"投机系"技术的统一框架。</p>
 
-<h2>基本流程</h2>
+<h2>Decode 为什么慢：算存比视角</h2>
+
+<p>设模型参数量 <em>P</em>，权重精度 <em>b</em> 字节（bf16 → 2, fp8 → 1）。
+忽略 attention 部分，一次<strong>稠密前向</strong>对 <em>n</em> 个 token 的代价大致是：</p>
+
+<table>
+  <thead><tr><th>资源</th><th>消耗</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>HBM → SRAM 传输</td><td><code>bytes ≈ P · b</code></td><td>权重<strong>只被读一次</strong>，与 n 几乎无关</td></tr>
+    <tr><td>浮点计算</td><td><code>FLOPs ≈ 2 · P · n</code></td><td>每个 token 都要乘一遍权重</td></tr>
+    <tr><td>算存比</td><td><code>AI = 2 · n / b</code> FLOPs/byte</td><td>仅与 <strong>n</strong> 和精度 b 相关</td></tr>
+  </tbody>
+</table>
+
+<p>对于 bf16 模型，单 token decode（<em>n</em>=1）下 <code>AI ≈ 1 FLOPs/byte</code>。
+作为对照——下面是主流 GPU 的<strong>计算/带宽比</strong>（即 roofline 拐点 AI*）：</p>
+
+<table>
+  <thead><tr><th>GPU</th><th>带宽 BW</th><th>BF16 算力</th><th>拐点 AI*</th></tr></thead>
+  <tbody>
+    <tr><td>NVIDIA A100 80GB</td><td>2.0 TB/s</td><td>312 TFLOPS</td><td>~156 FLOPs/byte</td></tr>
+    <tr><td>NVIDIA H100 SXM</td><td>3.35 TB/s</td><td>989 TFLOPS</td><td>~295 FLOPs/byte</td></tr>
+    <tr><td>NVIDIA B200</td><td>8.0 TB/s</td><td>2250 TFLOPS</td><td>~280 FLOPs/byte</td></tr>
+    <tr><td>AMD MI300X</td><td>5.3 TB/s</td><td>1307 TFLOPS</td><td>~245 FLOPs/byte</td></tr>
+  </tbody>
+</table>
+
+<p>结论：单 token decode 的 AI（≈1）比拐点 AI*（~150–300）低<strong>两个数量级</strong>。
+GPU 的算力被严重浪费——这块"未用算力"，就是投机解码可以收割的红利。</p>
+
+<div class="mermaid">
+flowchart LR
+  subgraph M[Memory-bound 区]
+    direction LR
+    D1["普通 Decode\nn=1, AI≈1"]
+  end
+  subgraph K[拐点 AI*]
+    D2["大 batch / 长 prefill\nAI≈150~300"]
+  end
+  subgraph C[Compute-bound 区]
+    D3["再增加也不变快"]
+  end
+  D1 -- "投机解码把 n→k+1\nAI 提升 (k+1) 倍" --> D2
+  D2 --> D3
+</div>
+
+<h2>投机解码如何把 AI 推到拐点</h2>
+
+<p>SD 的核心操作只有一个：让 target 模型在<strong>一次前向</strong>里同时验证 <em>k+1</em> 个位置
+（k 个 draft 候选 + 1 个 bonus token）。从 roofline 看：</p>
+
+<ul>
+  <li>HBM 流量几乎不变（权重一次性读入，KV 多读 k 倍但量级远小于权重）；</li>
+  <li>FLOPs 线性增长 (k+1) 倍；</li>
+  <li>因此 <code>AI ≈ 2(k+1)/b</code>，把工作点向右"平移" (k+1) 倍。</li>
+</ul>
+
+<p>只要平移后<strong>仍在 memory-bound 区</strong>（即 k+1 ≤ AI*），target 的一次 forward
+<strong>时间几乎不变</strong>，但一次前向却拿到了"1 + αk"个 token（α 为接受率），
+端到端 decode 吞吐线性提升。</p>
+
+<h3>定量：理论加速比</h3>
+<p>记单步加速比 <em>S</em>。在<strong>单流</strong>（batch=1）场景下：</p>
+<pre><code class="language-text">朴素 decode 单步:       T_base ≈ P·b / BW
+SD 单步 (k+1 位置):     T_sd   ≈ max( P·b / BW,            // 仍可能内存受限
+                                    2·(k+1)·P / FLOPS ) // 推到拐点之后
+SD 平均产出:            n_tok  = 1 + α·k
+单步加速比 S = (1 + α·k) · T_base / T_sd
+
+仅当 (k+1) &lt; AI*      → T_sd ≈ T_base   → S ≈ 1 + α·k   (理想情形)
+当   (k+1) ≥ AI*      → T_sd 随 (k+1) 线性增长 → S 见顶并下滑</code></pre>
+
+<p>再把 <strong>draft 成本</strong> T_d ≈ k · P_d · b / BW 计入（P_d = draft 参数量）：</p>
+<pre><code class="language-text">S = (1 + α·k) / ( 1 + T_d / T_base )
+  ≈ (1 + α·k) / ( 1 + k · P_d / P )</code></pre>
+
+<p>对常见组合做个估算：</p>
+<table>
+  <thead><tr><th>Target</th><th>Draft</th><th>k</th><th>α（典型）</th><th>理论 S</th></tr></thead>
+  <tbody>
+    <tr><td>Llama-3.1-70B</td><td>Llama-3.2-1B（同家族）</td><td>5</td><td>0.65</td><td>(1+3.25)/(1+5/70) ≈ <strong>3.96×</strong></td></tr>
+    <tr><td>Llama-3.1-70B</td><td>Llama-3.2-1B</td><td>3</td><td>0.65</td><td>(1+1.95)/(1+3/70) ≈ <strong>2.83×</strong></td></tr>
+    <tr><td>Llama-3.1-70B</td><td>Mistral-7B（跨家族）</td><td>5</td><td>0.30</td><td>(1+1.5)/(1+35/70) ≈ <strong>1.67×</strong></td></tr>
+    <tr><td>Qwen-2.5-72B</td><td>EAGLE head（≈0.3B）</td><td>5</td><td>0.75</td><td>(1+3.75)/(1+1.5/72) ≈ <strong>4.65×</strong></td></tr>
+  </tbody>
+</table>
+<p>实测落地通常是理论值的 <strong>40%~70%</strong>（kernel launch、tree 验证、采样开销等），
+对应大模型 decode <strong>1.5×~3×</strong> 的端到端加速。</p>
+
+<h3>与 batch / 连续批处理的相互作用</h3>
+
+<p>真正部署时是<strong>持续高 batch</strong> 的：target 一步同时跑 <em>B</em> 条请求，每条又携带 <em>k+1</em> 个位置，
+拐点位置就变成 <code>AI* / (k+1)</code> 处的<strong>有效 batch</strong>。简化结论：</p>
+
+<table>
+  <thead><tr><th>有效 batch B·(k+1)</th><th>所处区域</th><th>SD 的边际收益</th></tr></thead>
+  <tbody>
+    <tr><td>&lt; AI*（远小于）</td><td>Memory-bound</td><td><strong>免费的 (1+αk) 倍</strong> ← 甜区</td></tr>
+    <tr><td>≈ AI*</td><td>拐点附近</td><td>仍正收益，但边际递减</td></tr>
+    <tr><td>&gt; AI*（远大于）</td><td>Compute-bound</td><td>SD 反而<strong>变慢</strong>（多算 k 倍 FLOPs）</td></tr>
+  </tbody>
+</table>
+
+<p>这就是为什么——</p>
+<ul>
+  <li><strong>低 QPS / 在线对话</strong>：SD 最划算；</li>
+  <li><strong>极高吞吐压测（B 很大）</strong>：SD 可能<strong>关掉</strong>反而更好；</li>
+  <li><strong>混合场景</strong>：vLLM 可以按当前 batch 自适应调整 k（draft 数）。</li>
+</ul>
+
+<h2>基本流程与无损保证</h2>
 <div class="mermaid">
 sequenceDiagram
   participant D as Draft 模型(小)
   participant T as Target 模型(大)
-  D->>D: 生成 k 个候选 token t1..tk
-  D->>T: 把 [prompt, t1..tk] 一次前向
-  T-->>T: 对每个位置算自己的概率
-  Note over T: 从左到右逐个接受/拒绝
-  T-->>D: 接受 m 个 token(0 ≤ m ≤ k), 第 m+1 个用 T 的 token 覆盖
+  D->>D: 自回归生成 k 个候选 token t1..tk + draft 概率 q
+  D->>T: 把 [前缀, t1..tk] 一次前向
+  T-->>T: 对每个位置算 target 概率 p
+  Note over T: 从左到右用重要性采样接受/拒绝
+  T-->>D: 接受 m 个 token (0≤m≤k), 第 m+1 个 token 按修正分布重采样
 </div>
 
-<p>关键性质：接受/拒绝过程使用<strong>重要性采样</strong>，
-保证最终分布与"完全用 target 自回归生成"<strong>完全等价</strong>——投机解码<strong>不损精度</strong>，
-是无损加速。</p>
+<h3>接受规则（Leviathan / Chen, 2023）</h3>
+<p>对位置 <em>i</em>，draft 给出概率 <em>q<sub>i</sub>(x)</em>，target 给出 <em>p<sub>i</sub>(x)</em>。
+对 draft 输出的 token <em>t<sub>i</sub></em>：</p>
+<pre><code class="language-text">接受概率: r_i = min(1, p_i(t_i) / q_i(t_i))
+若拒绝: 从 残差分布 max(0, p_i - q_i) / Σ_x max(0, p_i(x) - q_i(x)) 中重采样一个新 token
+之后位置丢弃，下一轮重新 draft。</code></pre>
+<p>可证明：经过这个规则得到的整条序列分布 = 直接用 target 自回归生成 的分布。
+即 SD 是<strong>数学上无损的</strong>——温度、top-p、top-k 等所有采样参数都仍适用。</p>
 
-<h2>vLLM 支持的算法</h2>
+<div class="callout info">
+  <span class="callout-title">为什么"无损"很重要？</span>
+  <p>不像量化（精度损失换吞吐），SD 是<strong>纯加速</strong>。你不需要单独评估
+  "开启 SD 后下游指标是否退步"——只需关心是否真的快了。</p>
+</div>
+
+<h2>从线性候选到 Tree Attention</h2>
+
+<p>朴素 SD 让 draft 给出<strong>一条直线</strong> 的 k 个候选。
+现代 SD 让 draft 给出<strong>一棵树</strong>——每个位置上保留 top-r 个分支，
+target 用<strong>定制的 tree attention mask</strong> 在一次前向里同时验证所有分支。</p>
+
+<div class="mermaid">
+flowchart LR
+  Prefix --> A1[t1=a]
+  Prefix --> A2[t1=b]
+  A1 --> B1[t2=ax]
+  A1 --> B2[t2=ay]
+  A2 --> B3[t2=bz]
+  B1 --> C1[t3=axp]
+  B1 --> C2[t3=axq]
+  B2 --> C3[t3=ayp]
+  B3 --> C4[t3=bzr]
+</div>
+
+<p>好处：</p>
+<ul>
+  <li>同一个 batch slot 内可以保留多个路径，<strong>有效接受率显著提高</strong>（α 从 ~0.4→0.7+）；</li>
+  <li>多走的算力<strong>仍在 memory-bound 甜区</strong>之内——相当于把 k 横向扩成树宽 ×深度；</li>
+  <li>vLLM V1 的 spec_decode 实现就是 tree-aware 的（EAGLE-2/3 默认开启）。</li>
+</ul>
+
+<p>代价是 attention mask 变得稀疏不规则——需要 <strong>FlashAttention / FlashInfer 的 tree-mask 内核</strong>支持。</p>
+
+<h2>投机推理技术家谱</h2>
+
+<p>"用一个便宜的预测者 + 一次性验证" 这个框架下，社区在三个维度上演化：
+<strong>预测者结构</strong>、<strong>验证形态</strong>、<strong>训练/无训练</strong>。
+下表是当前主流方案的全景对比（标 ✅ = vLLM V1 已内建支持，🔧 = 通过 plugin / 外部 fork）：</p>
+
 <table>
-  <thead><tr><th>算法</th><th>Draft 来源</th><th>说明</th></tr></thead>
+  <thead><tr>
+    <th>方案</th><th>年份</th><th>Draft 来源</th><th>结构</th>
+    <th>需训练</th><th>典型加速</th><th>vLLM</th>
+  </tr></thead>
   <tbody>
-    <tr><td>N-gram</td><td>从 prompt 中抽取常见 n-gram</td><td>零额外参数，适合长重复模板</td></tr>
-    <tr><td>独立小模型</td><td>另一个 LM（如 1B / 3B 同家族）</td><td>通用最稳，需多放一份权重</td></tr>
-    <tr><td><strong>Medusa</strong></td><td>主模型加多个"输出头"</td><td>不需要单独模型，吞吐增益中等</td></tr>
-    <tr><td><strong>EAGLE</strong> / EAGLE-3</td><td>主模型 hidden state 上的轻量 draft net</td><td>当下精度/吞吐最好的方案之一</td></tr>
-    <tr><td>MLPSpeculator</td><td>多头 MLP 推测</td><td>IBM 提出，简单</td></tr>
+    <tr><td><strong>Vanilla SD</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Leviathan / Chen 2023</span></td>
+        <td>2023</td><td>独立小 LM（同家族）</td><td>线性 k</td>
+        <td>否</td><td>1.5–2×</td><td>✅</td></tr>
+    <tr><td><strong>PLD / N-gram</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Prompt Lookup Decoding</span></td>
+        <td>2023</td><td>当前 prompt 自身的 n-gram</td><td>线性 k</td>
+        <td>否</td><td>1.3–4×（强重复时）</td><td>✅</td></tr>
+    <tr><td><strong>Medusa</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Cai et al. 2024</span></td>
+        <td>2024</td><td>Target 上挂多个 LM head（预测 +1/+2/+3…）</td><td>树</td>
+        <td>需训练 heads</td><td>1.5–2.5×</td><td>✅</td></tr>
+    <tr><td><strong>EAGLE</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Li et al. 2024</span></td>
+        <td>2024</td><td>Target hidden state + 上一 token，跑一层轻量 Transformer</td><td>线性</td>
+        <td>需训练 head</td><td>2–3×</td><td>✅</td></tr>
+    <tr><td><strong>EAGLE-2</strong></td>
+        <td>2024</td><td>EAGLE + 动态树（按置信度展开）</td><td>动态树</td>
+        <td>同上</td><td>2.5–3.5×</td><td>✅</td></tr>
+    <tr><td><strong>EAGLE-3</strong></td>
+        <td>2025</td><td>多层特征聚合 + 训练时直接对齐采样后分布</td><td>动态树</td>
+        <td>同上</td><td>3–4.5×</td><td>✅</td></tr>
+    <tr><td><strong>MLPSpeculator</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">IBM, 2023</span></td>
+        <td>2023</td><td>多头 MLP 直接预测后续 token</td><td>线性</td>
+        <td>需训练</td><td>1.5–2.5×</td><td>✅</td></tr>
+    <tr><td><strong>Hydra</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Ankner et al. 2024</span></td>
+        <td>2024</td><td>Medusa 改进：head 之间引入因果依赖</td><td>树</td>
+        <td>需训练</td><td>1.8–2.7×</td><td>🔧</td></tr>
+    <tr><td><strong>SpecInfer</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Miao et al. 2023</span></td>
+        <td>2023</td><td>多个小 LM 并行 draft + token tree</td><td>树</td>
+        <td>否</td><td>1.6–2.5×</td><td>🔧</td></tr>
+    <tr><td><strong>Sequoia</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Chen et al. 2024</span></td>
+        <td>2024</td><td>用动态规划求"最优树形状"（在算力预算下最大化期望接受深度）</td><td>最优树</td>
+        <td>否</td><td>2–4×</td><td>🔧</td></tr>
+    <tr><td><strong>Lookahead Decoding</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Fu et al. 2024</span></td>
+        <td>2024</td><td>用 Jacobi 迭代在 target 自身上构造候选，<strong>无 draft 模型</strong></td><td>n-gram pool</td>
+        <td>否</td><td>1.5–2.3×</td><td>🔧</td></tr>
+    <tr><td><strong>Self-Speculative / Layer-Skip</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Elhoushi et al. 2024</span></td>
+        <td>2024</td><td>Target 的前若干层 + 早退 head 当 draft（一份权重）</td><td>线性</td>
+        <td>训练时引入退出损失</td><td>1.5–2×</td><td>🔧</td></tr>
+    <tr><td><strong>REST</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">He et al. 2024</span></td>
+        <td>2024</td><td>从离线<strong>检索库</strong>中取与前缀相似的续写</td><td>多候选</td>
+        <td>否（建库即可）</td><td>1.3–2.5×</td><td>🔧</td></tr>
+    <tr><td><strong>Online SD</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Liu et al. 2024</span></td>
+        <td>2024</td><td>在线根据接受/拒绝事件持续<strong>微调 draft</strong></td><td>线性 / 树</td>
+        <td>在线学习</td><td>+10–30% 接受率</td><td>🔧</td></tr>
+    <tr><td><strong>Kangaroo</strong><br><span style="font-size:0.85em;color:var(--fg-muted)">Liu et al. 2024</span></td>
+        <td>2024</td><td>共享 target 前若干层 + 双重早退（早退做 draft，早退接受则早退完成）</td><td>动态</td>
+        <td>需训练 adapter</td><td>1.6–2.5×</td><td>🔧</td></tr>
   </tbody>
 </table>
 
-<h2>命令行示例</h2>
-<pre><code class="language-bash"># 独立小模型
+<h3>三句话总结技术演化</h3>
+<ol>
+  <li><strong>2023 年：参数/算力上动</strong>——独立小模型 / n-gram，最早证明 SD 可工程化。</li>
+  <li><strong>2024 年：结构上动</strong>——Medusa/EAGLE/Hydra 把 draft 缩成"target 的几层附件"，
+    Tree Attention 把候选从一条线扩成一棵树。</li>
+  <li><strong>2025 年：形状与训练目标上动</strong>——EAGLE-3、Sequoia、Online SD
+    用动态树形 / 动态规划 / 在线学习把"算力预算 ↔ 接受率"的取舍做到接近极限。</li>
+</ol>
+
+<h2>vLLM 中的实操</h2>
+
+<h3>启用与配置</h3>
+<pre><code class="language-bash"># A) 独立小模型（最通用、零门槛）
 vllm serve meta-llama/Llama-3.1-70B-Instruct \
   --speculative-config '{
     "model": "meta-llama/Llama-3.2-1B-Instruct",
     "num_speculative_tokens": 5
   }'
 
-# N-gram
-vllm serve &lt;model&gt; \
-  --speculative-config '{"method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}'
-
-# EAGLE
-vllm serve &lt;target&gt; \
+# B) N-gram / PLD（零额外权重，适合代码补全、模板化输出）
+vllm serve &lt;target-model&gt; \
   --speculative-config '{
-    "method": "eagle",
-    "model": "&lt;eagle-head-checkpoint&gt;",
-    "num_speculative_tokens": 5
+    "method": "ngram",
+    "num_speculative_tokens": 5,
+    "prompt_lookup_max": 4,
+    "prompt_lookup_min": 2
+  }'
+
+# C) EAGLE / EAGLE-3（吞吐最高，需要单独训练好的 head）
+vllm serve &lt;target-model&gt; \
+  --speculative-config '{
+    "method": "eagle3",
+    "model": "&lt;eagle3-head-checkpoint&gt;",
+    "num_speculative_tokens": 5,
+    "draft_tensor_parallel_size": 1
+  }'
+
+# D) Medusa（target 自带 medusa head 的 checkpoint）
+vllm serve &lt;medusa-aware-model&gt; \
+  --speculative-config '{
+    "method": "medusa",
+    "num_speculative_tokens": 4
   }'</code></pre>
 
-<h2>实际收益取决于"接受率"</h2>
-<p>记单步候选数 = <em>k</em>，接受率（每候选被采纳的概率）= <em>α</em>，则平均每步实际产出
-<em>1 + αk</em> 个 token。但每步成本变成<strong>"draft 算力 + target 一次 k+1 长度的前向"</strong>。</p>
-<p>所以投机解码并不总是赢：</p>
+<h3>关键参数与含义</h3>
+<table>
+  <thead><tr><th>字段</th><th>说明</th><th>调优经验</th></tr></thead>
+  <tbody>
+    <tr><td><code>num_speculative_tokens</code></td><td>k：每轮 draft 候选数</td><td>对话 3–5、代码 5–8；先小后大</td></tr>
+    <tr><td><code>method</code></td><td>ngram / eagle / eagle3 / medusa / mlp_speculator / draft_model</td><td>EAGLE-3 ≫ Medusa ≫ 独立小模型 ≫ ngram（一般规律）</td></tr>
+    <tr><td><code>draft_tensor_parallel_size</code></td><td>draft 自己的 TP（通常 = 1）</td><td>draft 小，TP 提多了反而通信开销大</td></tr>
+    <tr><td><code>prompt_lookup_max/min</code></td><td>ngram 的 n 长度范围</td><td>代码场景 4–6，对话 2–4</td></tr>
+    <tr><td><code>disable_by_batch_size</code></td><td>有效 batch 超过此值时自动禁用 SD</td><td><strong>强烈建议设</strong>——避免大 batch 下倒贴</td></tr>
+  </tbody>
+</table>
+
+<h3>监控指标</h3>
+<p>在 <code>/metrics</code> 端点能看到：</p>
 <ul>
-  <li>α 低时（draft 与 target 风格差太多），可能负收益；</li>
-  <li>k 太大时，目标模型的"批"会变胖，单步反而慢；</li>
-  <li>高并发 batch 下，target 本身已经在大批跑了，draft 引入的串行约束会限制吞吐。</li>
+  <li><code>vllm:spec_decode_num_accepted_tokens</code> / <code>num_emitted_tokens</code>
+    → 计算接受率 α；</li>
+  <li><code>vllm:spec_decode_draft_acceptance_rate</code>（按版本而异）；</li>
+  <li><code>vllm:time_per_output_token_seconds</code> 在开启前后对比；</li>
+  <li><code>vllm:num_requests_running</code> 用于推断当前有效 batch。</li>
 </ul>
 
-<div class="callout info">
-  <span class="callout-title">经验值</span>
-  <p>通用对话：k=3~5，期望加速 1.3×~1.8×；编码 / 模板化输出：k=5~8，可见 2× 以上；
-  与同家族 1B 作 draft 通常优于跨家族；强烈建议先用 <code>benchmark_serving.py</code> 实测。</p>
+<h3>调优 checklist</h3>
+<div class="callout success">
+  <span class="callout-title">从小到大、按指标决策</span>
+  <ol>
+    <li><strong>k=1 试水</strong>：验证管道通了；</li>
+    <li>看接受率：&lt; 30% 直接换 draft（更同源 / 改用 EAGLE）；</li>
+    <li>看 TPOT：开启后比 baseline 下降才有意义；</li>
+    <li>看 batch：用 <code>disable_by_batch_size</code> 防止高并发下倒贴；</li>
+    <li>k 扫 1,3,5,7：找到本工作负载的 sweet spot；</li>
+    <li>Tree 方法下，<code>num_speculative_tokens</code> 是树<strong>深度</strong>，
+      树宽由 method 自身控制（EAGLE 系列默认动态）。</li>
+  </ol>
 </div>
 
-<h2>源码位置</h2>
+<h3>源码位置</h3>
 <ul>
-  <li>V1：<code>vllm/v1/spec_decode/</code>（draft runner、proposer、verifier）。</li>
-  <li>EAGLE、Medusa 的特殊 head：<code>vllm/model_executor/models/eagle*.py</code> 等。</li>
+  <li><strong>V1 主路径</strong>：<code>vllm/v1/spec_decode/</code>
+    <ul>
+      <li><code>proposer.py</code> — draft 产生候选树/链</li>
+      <li><code>verifier.py</code> / <code>rejection_sampler.py</code> — 重要性采样接受/拒绝</li>
+      <li><code>eagle.py</code> / <code>medusa.py</code> / <code>ngram_proposer.py</code> — 各算法实现</li>
+    </ul>
+  </li>
+  <li><strong>模型实现</strong>：<code>vllm/model_executor/models/eagle*.py</code> 与同名 medusa/mlp_speculator</li>
+  <li><strong>调度配合</strong>：<code>vllm/v1/core/sched/scheduler.py</code> 中对 draft / verify 两阶段的 batching</li>
+  <li><strong>kernels</strong>：tree attention mask 的 FlashAttention / FlashInfer 接口</li>
 </ul>
 
-<h2>排障 checklist</h2>
+<h2>常见误区与排障</h2>
+
+<div class="callout warn">
+  <span class="callout-title">"高 batch 压测下吞吐反而降了"</span>
+  <p>不是 bug，是物理规律——见上面"与 batch 的相互作用"。解法：
+  设 <code>disable_by_batch_size</code>，或对在线/离线两种流量分开起两套 vLLM。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"接受率怎么也上不去"</span>
+  <p>常见原因：(1) 跨家族 draft（tokenizer/分布差太多）；(2) 创作 / 高温度场景（每个 token 都有多种合理选择，draft 难命中）；(3) 模板没对齐（chat template 用错）。
+  对策：换同家族 draft 或上 EAGLE；高温度时把 k 调小至 2–3；务必检查 <code>tokenizer.eos_token_id</code> 一致。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"显存变紧"</span>
+  <p>Draft 模型占额外显存。粗算 P_d × b 字节。EAGLE/Medusa 的 head 一般 &lt;1 GB；
+  独立 1B–7B draft 需要预留几个 GB。可同时降 <code>--gpu-memory-utilization</code> 给 SD 留预算。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"和量化叠用"</span>
+  <p>SD 与权重量化（AWQ/GPTQ/FP8）正交——理论上能叠。但要注意：量化压低了 T_base，
+  相对收益会缩水（因为 T_base 本来就小了，SD 的"省"占比变小）。
+  实测 FP8 + EAGLE-3 仍能在 1.5–2× 区间。</p>
+</div>
+
+<h2>延伸阅读</h2>
 <ul>
-  <li>开关后吞吐反而下降 → 用 <code>num_speculative_tokens=1</code> 试，再逐步加。</li>
-  <li>接受率长期低于 30% → 换更同源的 draft 模型；或改用 EAGLE。</li>
-  <li>显存爆 → draft 模型也占显存，记得预留。</li>
+  <li>Leviathan et al., <em>Fast Inference from Transformers via Speculative Decoding</em>, ICML 2023</li>
+  <li>Chen et al., <em>Accelerating Large Language Model Decoding with Speculative Sampling</em>, 2023</li>
+  <li>Cai et al., <em>Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</em>, 2024</li>
+  <li>Li et al., <em>EAGLE / EAGLE-2 / EAGLE-3</em>, 2024–2025</li>
+  <li>Fu et al., <em>Break the Sequential Dependency of LLM Inference Using Lookahead Decoding</em>, 2024</li>
+  <li>Miao et al., <em>SpecInfer: Accelerating Generative LLM Serving with Tree-based Speculative Inference</em>, 2024</li>
+  <li>Chen et al., <em>Sequoia: Scalable, Robust, and Hardware-aware Speculative Decoding</em>, 2024</li>
+  <li>Williams et al., <em>Roofline: An Insightful Visual Performance Model for Multicore Architectures</em>, 2009（roofline 原始论文）</li>
 </ul>
 
 <p>下一页：<a href="12-lora.html">LoRA 多适配器</a>——一份基座、多份能力。</p>

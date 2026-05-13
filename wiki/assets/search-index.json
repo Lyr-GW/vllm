@@ -68,8 +68,8 @@
   {
     "title": "投机解码",
     "url": "pages/11-speculative-decoding.html",
-    "summary": "Draft + Target 模型协作，N-gram / Medusa / EAGLE 等方案与接受率分析。",
-    "keywords": ["speculative decoding", "投机解码", "draft", "eagle", "medusa", "ngram", "n-gram", "mlpspeculator"]
+    "summary": "用算存比 / Roofline 视角解释 SD 的加速来源，覆盖 Vanilla SD / Medusa / EAGLE / EAGLE-3 / Sequoia / Lookahead / Self-Spec 等技术全景。",
+    "keywords": ["speculative decoding", "投机解码", "投机推理", "draft", "eagle", "eagle-2", "eagle-3", "medusa", "hydra", "ngram", "n-gram", "prompt lookup", "pld", "mlpspeculator", "specinfer", "sequoia", "lookahead decoding", "self-speculative", "layer-skip", "rest", "online speculative decoding", "kangaroo", "tree attention", "roofline", "算存比", "arithmetic intensity", "memory-bound", "接受率", "rejection sampling"]
   },
   {
     "title": "LoRA 多适配器",
