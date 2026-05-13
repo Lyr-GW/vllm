@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>采样与结构化输出 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 采样与结构化输出">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="sampling">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>采样与结构化输出</h1>
+<p class="page-meta"><span>🛠️ 使用面 · 15/22</span></p>
+
+<h2>SamplingParams 核心字段</h2>
+<table>
+  <thead><tr><th>字段</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td><code>n</code></td><td>每条 prompt 生成多少条候选</td></tr>
+    <tr><td><code>best_of</code></td><td>内部候选数（旧字段，OpenAI 兼容用）</td></tr>
+    <tr><td><code>temperature</code></td><td>softmax 温度，0 = greedy</td></tr>
+    <tr><td><code>top_p</code></td><td>核采样阈值</td></tr>
+    <tr><td><code>top_k</code></td><td>截断 token 数</td></tr>
+    <tr><td><code>min_p</code></td><td>相对最大概率的最小阈值</td></tr>
+    <tr><td><code>repetition_penalty</code> / <code>presence_penalty</code> / <code>frequency_penalty</code></td><td>抑制重复</td></tr>
+    <tr><td><code>max_tokens</code></td><td>最大生成长度</td></tr>
+    <tr><td><code>min_tokens</code></td><td>最小生成长度（生成不足时强制忽略 EOS）</td></tr>
+    <tr><td><code>stop</code> / <code>stop_token_ids</code></td><td>停止串 / 停止 token</td></tr>
+    <tr><td><code>logprobs</code></td><td>返回 top-N 的对数概率</td></tr>
+    <tr><td><code>seed</code></td><td>随机种子（可复现）</td></tr>
+    <tr><td><code>use_beam_search</code></td><td>Beam Search</td></tr>
+    <tr><td><code>guided_*</code></td><td>结构化输出（见下）</td></tr>
+  </tbody>
+</table>
+
+<h2>结构化输出</h2>
+<p>vLLM 集成 <strong>XGrammar</strong> 与 <strong>Outlines</strong>，可以在 decode 时
+<strong>实时把 logits mask 成只允许"合法 token"</strong>，从而保证输出 100% 符合给定模式。</p>
+
+<h3>Guided JSON</h3>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+from pydantic import BaseModel
+
+class Person(BaseModel):
+    name: str
+    age: int
+    hobbies: list[str]
+
+llm = LLM(model="&lt;your-model&gt;")
+params = SamplingParams(
+    temperature=0.7,
+    max_tokens=200,
+    guided_decoding={"json": Person.model_json_schema()},
+)
+out = llm.generate(["请给我一个示例人物的 JSON："], params)
+print(out[0].outputs[0].text)   # 一定是合法 JSON，且符合 schema
+</code></pre>
+
+<h3>Guided Regex / Choice / Grammar</h3>
+<pre><code class="language-python">SamplingParams(guided_decoding={"regex": r"\d{4}-\d{2}-\d{2}"})
+SamplingParams(guided_decoding={"choice": ["positive", "negative", "neutral"]})
+SamplingParams(guided_decoding={"grammar": open("my.lark").read()})  # EBNF / Lark
+</code></pre>
+
+<h3>API 端用法</h3>
+<p>OpenAI 风格的 <code>response_format</code>：</p>
+<pre><code class="language-json">{
+  "model": "...",
+  "messages": [...],
+  "response_format": {"type": "json_object"}
+}</code></pre>
+<p>或者使用 vLLM 扩展字段：</p>
+<pre><code class="language-json">{
+  "extra_body": {"guided_json": {...schema...}}
+}</code></pre>
+
+<h2>Beam Search / Best-of</h2>
+<p>Beam Search 在 vLLM 中以 <strong>parallel sampling + 重写过程</strong> 实现，
+开销低（KV 共享 + CoW）。但对话场景多数情况下 nucleus / min-p 已足够，beam search 适合 NMT、摘要等结构化任务。</p>
+
+<h2>Logits Processors（自定义）</h2>
+<p>vLLM 允许用户提供一个 <code>LogitsProcessor</code> 函数：</p>
+<pre><code class="language-python">def disallow_word(logits, token_ids):
+    bad = tokenizer.convert_tokens_to_ids("禁词")
+    logits[..., bad] = -float("inf")
+    return logits
+
+params = SamplingParams(logits_processors=[disallow_word])
+</code></pre>
+
+<p>更进阶的玩法（自定义采样器 / 插件）见 <code>docs/design/logits_processors.md</code>。</p>
+
+<h2>调参 cheat sheet</h2>
+<ul>
+  <li><strong>事实问答 / 翻译 / 代码</strong>：<code>temperature=0</code> 或 <code>0.2</code>，可加 <code>top_p=0.9</code>。</li>
+  <li><strong>开放聊天</strong>：<code>temperature=0.7~0.9</code>，<code>top_p=0.95</code>，<code>min_p=0.05</code>。</li>
+  <li><strong>避免重复</strong>：<code>repetition_penalty=1.05~1.2</code>，过高反而生硬。</li>
+  <li><strong>固定格式</strong>：直接上结构化输出，比纯 prompt 工程稳得多。</li>
+</ul>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

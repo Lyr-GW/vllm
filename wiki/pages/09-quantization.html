@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>量化 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 量化">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="quantization">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>量化</h1>
+<p class="page-meta"><span>🚀 关键特性 · 9/22</span></p>
+
+<p>"量化"是把 fp16/bf16 权重（有时也包括激活、KV）用更少比特表达。在 vLLM 中，
+你<strong>不需要自己写量化代码</strong>——只要加载社区或厂商已量化好的 checkpoint，
+再传一个 <code>--quantization</code> 即可。</p>
+
+<h2>支持方案对比</h2>
+<table>
+  <thead><tr><th>方案</th><th>权重位宽</th><th>激活</th><th>KV</th><th>典型场景</th></tr></thead>
+  <tbody>
+    <tr><td><strong>FP8</strong>(E4M3/E5M2)</td><td>8 bit</td><td>FP8</td><td>FP8（可选）</td><td>Hopper/H100、MI300、最少精度损失</td></tr>
+    <tr><td><strong>INT8 SmoothQuant</strong></td><td>8 bit</td><td>INT8</td><td>—</td><td>Ampere/A100、H100，吞吐取向</td></tr>
+    <tr><td><strong>GPTQ</strong></td><td>4 bit（per-group）</td><td>FP16</td><td>—</td><td>显存优先，社区量产</td></tr>
+    <tr><td><strong>AWQ</strong></td><td>4 bit（per-group）</td><td>FP16</td><td>—</td><td>显存优先，量化质量略好</td></tr>
+    <tr><td><strong>AutoRound</strong></td><td>4/3/2 bit</td><td>FP16</td><td>—</td><td>极致显存（精度需评估）</td></tr>
+    <tr><td><strong>BitsAndBytes</strong>(QLoRA 友好)</td><td>4 bit (NF4) / 8 bit</td><td>FP16</td><td>—</td><td>研究 / 兼容性</td></tr>
+    <tr><td><strong>Marlin / Machete</strong></td><td>4/8 bit (kernel)</td><td>FP16</td><td>—</td><td>vLLM 内部高性能 GEMM 实现</td></tr>
+  </tbody>
+</table>
+
+<h2>命令行用法</h2>
+<pre><code class="language-bash"># GPTQ 模型
+vllm serve TheBloke/Llama-3-8B-Instruct-GPTQ --quantization gptq
+
+# AWQ 模型
+vllm serve TheBloke/Mistral-7B-Instruct-v0.2-AWQ --quantization awq
+
+# 原始权重 + 在线 FP8 量化 (NVIDIA Hopper+)
+vllm serve meta-llama/Llama-3.1-8B-Instruct --quantization fp8
+
+# KV Cache 也用 FP8（与权重量化正交）
+vllm serve &lt;model&gt; --kv-cache-dtype fp8_e4m3</code></pre>
+
+<p>大多数情况下 <code>--quantization</code> 可以省略，vLLM 会从模型的
+<code>config.json</code> 里的 <code>quantization_config</code> 字段自动识别。</p>
+
+<h2>该选哪一种</h2>
+<ul>
+  <li><strong>H100 / MI300 集群</strong>：首选 <strong>FP8</strong>。精度几乎无损、有专门硬件指令、
+    可同时量化 weight + activation + KV，整机吞吐显著提升。</li>
+  <li><strong>A100 / 老一代 GPU</strong>：选 <strong>AWQ</strong> 或 <strong>GPTQ</strong> 4-bit。
+    社区生态最丰富，Marlin/Machete 内核已很成熟。</li>
+  <li><strong>研究 / 兼容</strong>：BitsAndBytes（与 PEFT / LoRA 训练栈协同好）。</li>
+  <li><strong>显存极度紧张</strong>：AutoRound 3-bit / 2-bit，但需要自己评估 task 上的精度。</li>
+</ul>
+
+<h2>"量化哪里"决定了什么</h2>
+<table>
+  <thead><tr><th>量化对象</th><th>主要省什么</th><th>影响</th></tr></thead>
+  <tbody>
+    <tr><td>权重</td><td>显存</td><td>显存随位宽缩减，延迟随后端 kernel 而定</td></tr>
+    <tr><td>激活</td><td>计算（Tensor Core 用低精度乘）</td><td>主要影响吞吐</td></tr>
+    <tr><td>KV Cache</td><td>显存（按 token 累积）</td><td>长上下文场景显著节省</td></tr>
+  </tbody>
+</table>
+
+<h2>精度评估</h2>
+<p>量化必须搭<strong>下游评估</strong>。常见做法：</p>
+<ul>
+  <li>跑 <a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noopener">lm-evaluation-harness</a>
+    对比 fp16 与量化后的 baseline。</li>
+  <li>关键业务集（自己的 prompt 集）做 A/B 离线评测。</li>
+  <li>对 Mixture-of-Experts 模型，注意 expert routing 对低 bit 更敏感，必要时只量化非 MoE 层。</li>
+</ul>
+
+<h2>实现要点</h2>
+<ul>
+  <li>vLLM 在 <code>vllm/model_executor/layers/quantization/</code> 注册各类量化"线性层"。</li>
+  <li>核心 GEMM 内核在 <code>csrc/quantization/</code> 与 <code>csrc/cutlass_extensions/</code> 下：
+    Marlin、Machete、cutlass-based FP8、AWQ kernels…</li>
+  <li>KV Cache 量化由 <code>kv_cache_dtype</code> 控制，scale 因子由模型 config 或运行时统计获得。</li>
+</ul>
+
+<h2>常见坑</h2>
+<div class="callout warn">
+  <span class="callout-title">"加了量化反而变慢？"</span>
+  <p>有可能：4-bit GPTQ 在<strong>极小 batch + 短 seq</strong> 下，dequant 开销可能盖过 GEMM 收益。
+  量化收益在<strong>大 batch / 长序列 / 多并发</strong>下才明显。</p>
+</div>
+<div class="callout warn">
+  <span class="callout-title">"FP8 模型在 A100 上能跑吗？"</span>
+  <p>不能用 FP8 Tensor Core。需要选 fp16/bf16 或 AWQ/GPTQ 版。FP8 需要 Hopper 及以上。</p>
+</div>
+
+<p>下一页：<a href="10-parallelism.html">分布式与并行</a>——当一张卡不够时怎么办。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

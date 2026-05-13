@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vLLM Wiki — 中文学习与速查</title>
+<meta name="description" content="vLLM 项目的中文学习 Wiki：架构、PagedAttention、KV 缓存、连续批处理、量化、分布式并行、LoRA、多模态、OpenAI 兼容 API 等。">
+<link rel="icon" href="assets/img/logo.svg">
+<link rel="stylesheet" href="assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="home">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap no-toc">
+    <main class="content">
+
+<section style="margin: 18px 0 28px;">
+  <h1 style="border:none;font-size:2.4rem;margin-bottom:8px;">vLLM Wiki</h1>
+  <p style="font-size:1.1rem;color:var(--fg-soft);max-width:760px;">
+    一份面向中文读者的 <strong>vLLM</strong> 学习与速查 Wiki：从架构到 PagedAttention，
+    从连续批处理到分布式并行，从量化到多模态——把这个高吞吐 LLM 推理引擎里最值得理解的概念
+    一次说清楚。
+  </p>
+  <div class="tags" style="margin-top:14px;">
+    <span class="tag">LLM Inference</span>
+    <span class="tag">PagedAttention</span>
+    <span class="tag">Continuous Batching</span>
+    <span class="tag">Quantization</span>
+    <span class="tag">Tensor / Pipeline / Expert Parallelism</span>
+    <span class="tag">LoRA</span>
+    <span class="tag">OpenAI API</span>
+  </div>
+</section>
+
+<section>
+  <h2 style="border:none;">为什么读这份 Wiki</h2>
+  <div class="cards">
+    <div class="card">
+      <span class="card-icon">⚡</span>
+      <h3>把"快"讲透</h3>
+      <p>不仅告诉你 vLLM 快，更解释 PagedAttention、连续批处理、CUDA Graph 等
+        机制为何能把 throughput 提升一个数量级。</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🧠</span>
+      <h3>把"复杂"拆细</h3>
+      <p>调度器、KV Cache、TP/PP/EP、投机解码、LoRA、多模态——逐页拆解关键源码模块。</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🛠️</span>
+      <h3>把"会用"做实</h3>
+      <p>覆盖安装、离线推理、OpenAI 兼容服务、采样参数、结构化输出、性能调优 checklist。</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">📚</span>
+      <h3>方便速查</h3>
+      <p>顶部搜索 + 侧边栏分组 + 全站术语表，遇到陌生概念几秒钟跳转。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>从这里开始</h2>
+  <div class="cards">
+    <a class="card" href="pages/01-introduction.html">
+      <h3>① 项目简介</h3>
+      <p>vLLM 是什么、出身、解决了什么问题。</p>
+    </a>
+    <a class="card" href="pages/02-architecture.html">
+      <h3>② 整体架构</h3>
+      <p>三大入口、引擎-调度器-Worker 流水线，V0/V1 差异。</p>
+    </a>
+    <a class="card" href="pages/03-installation.html">
+      <h3>③ 安装与环境</h3>
+      <p>pip / 源码 / Docker，及 CUDA/ROCm/CPU 注意事项。</p>
+    </a>
+    <a class="card" href="pages/04-quickstart.html">
+      <h3>④ 快速上手</h3>
+      <p>第一个离线推理 + 启动一个 OpenAI 兼容服务。</p>
+    </a>
+  </div>
+
+  <h2>核心原理</h2>
+  <div class="cards">
+    <a class="card" href="pages/05-paged-attention.html">
+      <h3>⑤ PagedAttention</h3>
+      <p>把 KV 缓存当做"操作系统的分页内存"。</p>
+    </a>
+    <a class="card" href="pages/06-kv-cache.html">
+      <h3>⑥ KV Cache & Prefix Cache</h3>
+      <p>块表、哈希索引、自动前缀复用。</p>
+    </a>
+    <a class="card" href="pages/07-continuous-batching.html">
+      <h3>⑦ 连续批处理</h3>
+      <p>Iteration-level 调度与 Chunked Prefill。</p>
+    </a>
+    <a class="card" href="pages/08-scheduler.html">
+      <h3>⑧ 调度器</h3>
+      <p>三态队列、抢占、Recompute vs Swap。</p>
+    </a>
+  </div>
+
+  <h2>关键特性</h2>
+  <div class="cards">
+    <a class="card" href="pages/09-quantization.html"><h3>⑨ 量化</h3><p>GPTQ / AWQ / FP8 / INT8 / INT4 / BNB。</p></a>
+    <a class="card" href="pages/10-parallelism.html"><h3>⑩ 分布式</h3><p>TP / PP / DP / EP / SP，多机多卡。</p></a>
+    <a class="card" href="pages/11-speculative-decoding.html"><h3>⑪ 投机解码</h3><p>N-gram / EAGLE / Medusa。</p></a>
+    <a class="card" href="pages/12-lora.html"><h3>⑫ LoRA</h3><p>多适配器在线切换。</p></a>
+    <a class="card" href="pages/13-multimodal.html"><h3>⑬ 多模态</h3><p>LLaVA / Qwen-VL / InternVL …</p></a>
+    <a class="card" href="pages/14-api-server.html"><h3>⑭ OpenAI API</h3><p>流式、函数调用、推理输出。</p></a>
+    <a class="card" href="pages/15-sampling.html"><h3>⑮ 采样</h3><p>结构化输出 / Guided JSON / Grammar。</p></a>
+    <a class="card" href="pages/16-cuda-graph-compile.html"><h3>⑯ CUDA Graph &amp; compile</h3><p>消除 kernel launch 开销。</p></a>
+  </div>
+
+  <h2>性能与参考</h2>
+  <div class="cards">
+    <a class="card" href="pages/17-hardware-support.html"><h3>⑰ 硬件后端</h3><p>NVIDIA / AMD / Intel / TPU / Gaudi …</p></a>
+    <a class="card" href="pages/18-benchmarking.html"><h3>⑱ 基准与调优</h3><p>TTFT / TPOT / ITL 与调优手册。</p></a>
+    <a class="card" href="pages/19-source-tree.html"><h3>⑲ 源码速查</h3><p>"我想改 xxx，去哪改？"</p></a>
+    <a class="card" href="pages/20-contributing.html"><h3>⑳ 贡献指南</h3><p>开发环境、PR 流程、新模型/硬件。</p></a>
+    <a class="card" href="pages/21-faq.html"><h3>㉑ FAQ</h3><p>显存不够、加速不线性、长上下文…</p></a>
+    <a class="card" href="pages/22-glossary.html"><h3>㉒ 术语表</h3><p>一站式中英术语对照。</p></a>
+  </div>
+</section>
+
+<section>
+  <h2>引用</h2>
+  <p>vLLM 的核心思想首次发表于 SOSP'23 论文 <em>"Efficient Memory Management for Large Language Model Serving with PagedAttention"</em>。
+    本 Wiki 仅作中文学习材料，不替代官方文档；如需权威信息，请访问
+    <a href="https://docs.vllm.ai" target="_blank" rel="noopener">docs.vllm.ai</a>。</p>
+</section>
+
+    </main>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/search.js"></script>
+</body>
+</html>

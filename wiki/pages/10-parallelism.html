@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>分布式与并行 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 分布式与并行">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="parallelism">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>分布式与并行</h1>
+<p class="page-meta"><span>🚀 关键特性 · 10/22</span></p>
+
+<p>当单卡显存 / 算力扛不住一个模型，或单实例吞吐撑不住流量，就需要并行。
+vLLM 提供 5 种正交的并行维度，可以组合：</p>
+
+<table>
+  <thead><tr><th>缩写</th><th>名称</th><th>切分对象</th><th>典型用途</th></tr></thead>
+  <tbody>
+    <tr><td>TP</td><td>Tensor Parallelism</td><td>每层权重矩阵按行/列切到不同 GPU</td><td>单层算不下时，最常用</td></tr>
+    <tr><td>PP</td><td>Pipeline Parallelism</td><td>不同层放到不同 GPU，流水推进</td><td>跨节点扩展，避免 TP 跨机带宽瓶颈</td></tr>
+    <tr><td>DP</td><td>Data Parallelism</td><td>整个引擎多副本，请求分流</td><td>纯吞吐扩展</td></tr>
+    <tr><td>EP</td><td>Expert Parallelism</td><td>MoE 的不同 expert 放到不同 GPU</td><td>大 MoE 模型（DeepSeek、Mixtral）</td></tr>
+    <tr><td>SP</td><td>Sequence / Context Parallelism</td><td>同一条 sequence 的不同 token 分到不同 GPU</td><td>超长上下文</td></tr>
+  </tbody>
+</table>
+
+<h2>Tensor Parallelism (TP)</h2>
+<p>把每个线性层的权重按维度切分。比如一个 <code>[H, 4H]</code> 的 FFN 权重，
+在 TP=2 时分别放两张卡上各 <code>[H, 2H]</code>，激活做<strong>列切分 / 行切分</strong>组合，
+最后用 <code>all_reduce</code> 同步。每一步需要一次或两次小通信。</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-70B-Instruct --tensor-parallel-size 4</code></pre>
+<p>实践建议：</p>
+<ul>
+  <li>TP 通信走 NVLink / NVSwitch 时最优，跨 PCIe 性能会差很多。</li>
+  <li>TP size 必须能整除 attention head 数与 FFN 隐藏维。</li>
+  <li>vLLM 自带 <strong>Custom All-Reduce</strong>（<code>csrc/custom_all_reduce.cu</code>）
+    在小消息上比 NCCL 更快。</li>
+</ul>
+
+<h2>Pipeline Parallelism (PP)</h2>
+<p>把模型的 <em>L</em> 层切成 <em>P</em> 段，每段放一台/一组 GPU。请求像流水线一样穿过：</p>
+<pre><code class="language-bash">vllm serve &lt;model&gt; --tensor-parallel-size 8 --pipeline-parallel-size 4</code></pre>
+<p>关键点：</p>
+<ul>
+  <li>跨机用 PP 比跨机用 TP 通信少（每条 seq 只在边界处传 activation）。</li>
+  <li>有"气泡"问题——首尾时刻有部分 stage 空闲；vLLM 用<strong>microbatch 间交错调度</strong>缓解。</li>
+</ul>
+
+<h2>Data Parallelism (DP)</h2>
+<p>不是真正"分一个模型"——而是<strong>每张卡（或每组卡）跑一个完整引擎</strong>，
+请求按 round-robin 或一致性 hash 分到不同副本。</p>
+<pre><code class="language-bash">vllm serve &lt;model&gt; --data-parallel-size 4</code></pre>
+<ul>
+  <li>简单、几乎零通信，吞吐线性扩展。</li>
+  <li>缺点：单卡装不下大模型时没法用。</li>
+  <li>常与 TP 组合：例如 8 卡 → 2×DP × 4×TP。</li>
+</ul>
+
+<h2>Expert Parallelism (EP)</h2>
+<p>MoE 模型（如 Mixtral 8x7B、DeepSeek-V3）每个 token 只激活 1~2 个 expert。
+把不同 expert 放到不同 GPU，token 路由后做 <strong>all-to-all</strong> 通信。</p>
+<pre><code class="language-bash">vllm serve deepseek-ai/DeepSeek-V3 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --expert-parallel-size 8</code></pre>
+<p>EP 对 all-to-all 带宽要求很高，NVLink + InfiniBand 是常见组合。
+vLLM 也提供 fused MoE kernel（<code>csrc/moe/</code>）压低非通信开销。</p>
+
+<h2>Sequence / Context Parallelism (SP)</h2>
+<p>超长上下文（如 1M）下，单卡放不下整条 sequence 的 KV，需要把 token 维度切开。
+具体实现因 backend 而异，详见
+  <a href="https://github.com/vllm-project/vllm/blob/main/docs/serving/context_parallel_deployment.md" target="_blank" rel="noopener">官方文档：Context Parallel Deployment</a>。</p>
+
+<h2>组合：一个 70B 上 8 卡的典型配置</h2>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 2 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.92</code></pre>
+<p>= 4 卡 TP × 2 段 PP = 8 卡，权重切到 4 份，每段两卡跑半个模型。</p>
+
+<h2>多机部署</h2>
+<p>vLLM 跨机依赖 Ray：</p>
+<ol>
+  <li>主节点：<code>ray start --head --port=6379</code></li>
+  <li>从节点：<code>ray start --address=&lt;head-ip&gt;:6379</code></li>
+  <li>主节点：<code>vllm serve &lt;model&gt; --tensor-parallel-size 16 --pipeline-parallel-size 2</code></li>
+</ol>
+<p>Ray 把 worker 进程自动调度到合适的机器；也可以用 <code>--distributed-executor-backend mp</code>
+在单机用 multiprocessing 替代 Ray。</p>
+
+<h2>排障 checklist</h2>
+<ul>
+  <li>NCCL 卡死？设 <code>NCCL_DEBUG=INFO</code>、检查 IB/RoCE。</li>
+  <li>P2P 失败？某些云上虚拟 GPU 不支持 P2P，需要 <code>NCCL_P2P_DISABLE=1</code>。</li>
+  <li>跨机带宽差？优先 PP > TP；如果带宽实在低，DP + 路由更稳。</li>
+  <li>启动慢？关掉 <code>--enforce-eager</code> 之外的不必要 CUDA Graph 捕获。</li>
+</ul>
+
+<p>继续：<a href="11-speculative-decoding.html">投机解码</a>——以小模型预测大模型，减少 decode 步数。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

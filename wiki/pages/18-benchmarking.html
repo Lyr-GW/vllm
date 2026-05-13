@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>基准与调优 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 基准与调优">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="benchmarking">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>基准与调优</h1>
+<p class="page-meta"><span>⚡ 性能 · 18/22</span></p>
+
+<h2>关键指标</h2>
+<table>
+  <thead><tr><th>指标</th><th>定义</th><th>受谁影响</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TTFT</strong> (Time To First Token)</td><td>请求到达 → 收到第一个输出 token 的时间</td><td>Prompt 长度、Prefix Cache 命中、调度排队</td></tr>
+    <tr><td><strong>TPOT</strong> (Time Per Output Token)</td><td>每个新 token 的平均时间（端到端）</td><td>Decode kernel、batch 大小、KV 总量</td></tr>
+    <tr><td><strong>ITL</strong> (Inter-Token Latency)</td><td>连续两个 token 之间的间隔</td><td>同上，但更细粒度</td></tr>
+    <tr><td><strong>Throughput</strong></td><td>所有请求合计的 tokens/sec</td><td>并发、Prefill 比例、量化、并行</td></tr>
+    <tr><td><strong>Goodput</strong></td><td>满足 SLA 内的有效吞吐</td><td>SLA + 上面所有</td></tr>
+  </tbody>
+</table>
+
+<h2>仓库自带基准脚本</h2>
+<p><code>benchmarks/</code> 目录提供常用脚本：</p>
+
+<h3>1. <code>benchmark_throughput.py</code> — 离线吞吐</h3>
+<pre><code class="language-bash">python benchmarks/benchmark_throughput.py \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name sharegpt --dataset-path ShareGPT.json \
+  --num-prompts 1000 --tensor-parallel-size 1</code></pre>
+
+<h3>2. <code>benchmark_serving.py</code> — 在线压测</h3>
+<pre><code class="language-bash"># 先在另一终端起 vllm serve ...
+python benchmarks/benchmark_serving.py \
+  --backend vllm --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name sharegpt --dataset-path ShareGPT.json \
+  --num-prompts 1000 --request-rate 16</code></pre>
+<p><code>--request-rate ∞</code>（或 <code>inf</code>）表示尽量并发，测稳态。</p>
+
+<h3>3. <code>benchmark_latency.py</code> — 单/小批延迟</h3>
+<pre><code class="language-bash">python benchmarks/benchmark_latency.py \
+  --model &lt;model&gt; --batch-size 1 --input-len 512 --output-len 128</code></pre>
+
+<h2>调优 checklist</h2>
+<div class="callout success">
+  <span class="callout-title">先看 KV 占用</span>
+  <p><code>vllm:gpu_cache_usage_perc</code> 长期 &lt; 60%？说明 batch 没打满，或 prompt 短；
+  可加大 <code>--max-num-seqs</code> / <code>--max-num-batched-tokens</code>。</p>
+</div>
+<div class="callout success">
+  <span class="callout-title">看抢占率</span>
+  <p><code>vllm:num_preemptions_total</code> 飙升 → 资源不够，降并发或加量化。</p>
+</div>
+<div class="callout success">
+  <span class="callout-title">看前缀命中</span>
+  <p><code>vllm:prefix_cache_hit_rate</code> 低于 30%？检查 system prompt 是否一致；
+    确认 <code>--enable-prefix-caching</code>。</p>
+</div>
+
+<p>一般来说从下面 8 个旋钮按顺序尝试：</p>
+<ol>
+  <li>开 / 确认 <code>--enable-chunked-prefill</code> 与 <code>--enable-prefix-caching</code>。</li>
+  <li>加大 <code>--max-num-seqs</code> 与 <code>--max-num-batched-tokens</code>，直到 GPU 占用近 100%。</li>
+  <li>试 <code>--kv-cache-dtype fp8_e4m3</code>（H100/MI300+）。</li>
+  <li>试 <code>--quantization fp8 / awq</code>。</li>
+  <li>合理设置 <code>--max-model-len</code>，避免预留过多 KV。</li>
+  <li>加 TP / PP 并行；按 NVLink 拓扑选维度。</li>
+  <li>调 <code>--gpu-memory-utilization</code>，留少量富余给 fragmentation。</li>
+  <li>遇到长 prompt 用 <code>--max-num-batched-tokens</code> 控制 chunk 粒度。</li>
+</ol>
+
+<h2>Profiling</h2>
+<ul>
+  <li><code>VLLM_TORCH_PROFILER_DIR=/tmp/prof vllm serve ...</code> → <code>torch.profiler</code> 输出。</li>
+  <li>NVIDIA Nsight Systems / Compute（<code>nsys profile</code>）观察 kernel 时间线。</li>
+  <li>Python 侧：<code>py-spy dump --pid &lt;pid&gt;</code> 看是否被 GIL / IO 卡住。</li>
+</ul>
+
+<h2>对比基线</h2>
+<p>使用同模型 / 同 prompt 集对比：</p>
+<ul>
+  <li>HuggingFace <code>transformers.generate()</code>：基线，最慢；</li>
+  <li>TGI（Text Generation Inference）：HuggingFace 自己的服务；</li>
+  <li>TensorRT-LLM：NVIDIA 极致优化，但工程量大；</li>
+  <li>SGLang / lmdeploy：vLLM 的同代竞品；</li>
+  <li>llama.cpp：CPU/边缘场景。</li>
+</ul>
+<p>核心是<strong>用同样的负载评测同样的指标</strong>——不要拿"单条 latency"对比"高并发 throughput"。</p>
+
+<p>下一页：<a href="19-source-tree.html">源码目录速查</a>。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

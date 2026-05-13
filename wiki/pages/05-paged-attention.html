@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PagedAttention 原理 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — PagedAttention 原理">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="paged-attention">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>PagedAttention 原理</h1>
+<p class="page-meta"><span>🧠 核心原理 · 5/22</span></p>
+
+<h2>为什么需要它</h2>
+<p>Transformer 自回归推理时，每生成一个 token，都要把当前 token 和<strong>全部历史 token</strong>的
+Key/Value 一起做注意力。为避免重复计算，历史的 K/V 会被缓存下来，这就是 <strong>KV Cache</strong>。
+它的大小约为：</p>
+
+<p style="text-align:center"><code>2 × L × H × d × seq_len × num_layers × dtype_size</code></p>
+<p>其中 <em>L</em>=batch、<em>H</em>=KV head 数、<em>d</em>=head dim。对 Llama-3-8B、seq_len=4096、fp16 而言，
+单条请求的 KV 缓存就有几百 MB。</p>
+
+<p>问题在于：每条请求的<strong>真实长度未知</strong>。传统做法是按 <code>max_seq_len</code> 预留连续内存，
+导致大量浪费——论文测得只有 <strong>~30%</strong> 的显存真正被有效利用。</p>
+
+<h2>核心思想：像 OS 那样分页</h2>
+<p>PagedAttention 把 KV 缓存切成固定大小的<strong>块（block）</strong>，每个 block 容纳 <code>block_size</code>
+个 token 的 K 与 V（默认 16）。一条 sequence 的若干 token 不必住在连续内存里，
+而是由一张<strong>块表（block table）</strong>记录"逻辑块号 → 物理块号"的映射——
+就像虚拟内存的页表。</p>
+
+<div class="mermaid">
+flowchart LR
+  subgraph Seq[一条请求的逻辑视图]
+    L0[逻辑块 0]
+    L1[逻辑块 1]
+    L2[逻辑块 2]
+  end
+  subgraph Pool[GPU 上的物理 KV Cache 池]
+    P0[Phys #0]
+    P5[Phys #5]
+    P9[Phys #9]
+    P3[Phys #3]
+    P7[Phys #7]
+  end
+  L0 -- block_table[0]=5 --> P5
+  L1 -- block_table[1]=9 --> P9
+  L2 -- block_table[2]=3 --> P3
+</div>
+
+<h2>带来的三个好处</h2>
+<ol>
+  <li><strong>近零碎片</strong>：除了每条请求最后一个块可能"半满"，其余块都是满的。
+    实测有效利用率从 ~30% 提升到 ~96%。</li>
+  <li><strong>动态增长</strong>：seq 边生成边按需追加新块，不需要预估长度。</li>
+  <li><strong>跨 seq 共享 / Copy-on-Write</strong>：当多个 seq 共享同一段前缀（比如同一个 system prompt），
+    它们的 block_table 前几项可以指向同一组物理块；只有写入时才复制。这正是
+    <a href="06-kv-cache.html">Prefix Caching</a> 与 beam search / 并行采样高效实现的基础。</li>
+</ol>
+
+<h2>Attention kernel 怎么访问</h2>
+<p>普通 FlashAttention 假设 K/V 是<strong>连续</strong>的。PagedAttention 的 CUDA kernel 多了一个
+<code>block_table</code> 输入，按 token 索引去查物理块，再以 warp / threadblock 为单位读入 SRAM 做 softmax。
+源码入口：</p>
+<ul>
+  <li><code>csrc/attention/</code>：自研的 paged attention 内核（V1 fallback 与 CPU 后端）。</li>
+  <li><code>vllm/attention/backends/</code>（V0）/ <code>vllm/v1/attention/backends/</code>（V1）：
+    通过 backend selector 把请求映射到 FlashAttention 2/3、FlashInfer、Triton、XFormers 等实现。</li>
+</ul>
+
+<p>简化的 prefix-share 数学不变：</p>
+<pre><code>Attention(Q, K, V) = softmax(Q · K^T / sqrt(d_k)) · V</code></pre>
+<p>只是 <code>K</code>、<code>V</code> 的物理读取按 block 拆开，再合并到同一个 softmax 归一化里。</p>
+
+<h2>block_size 怎么选</h2>
+<p><code>block_size</code> 是个权衡：</p>
+<ul>
+  <li>过小（如 4）：块表更大、kernel 控制流更多；</li>
+  <li>过大（如 64）：尾部浪费更多、Prefix Cache 命中粒度变粗。</li>
+</ul>
+<p>默认 16（FlashInfer 后端可能选 32 或 64）。一般不需要手动改，知道有这么个旋钮即可。</p>
+
+<h2>Copy-on-Write 的细节</h2>
+<p>当 beam search 或并行采样在某一步分叉，新分支需要从父分支"分出去"。vLLM 不复制整段 KV，
+而是<strong>共享之前的物理块</strong>，仅当某个块还没满需要继续写入时才复制一份新块，再写入新 token。
+这把多分支采样的显存开销压到接近"只多一条短尾巴"。</p>
+
+<h2>对外影响</h2>
+<table>
+  <thead><tr><th>能力</th><th>来自哪里</th></tr></thead>
+  <tbody>
+    <tr><td>同卡上能跑更多并发</td><td>KV 利用率 ≈ 96%</td></tr>
+    <tr><td>同一 system prompt 多用户共享</td><td>块级共享 + 哈希前缀缓存</td></tr>
+    <tr><td>Beam search、Best-of-n 不爆显存</td><td>Copy-on-Write</td></tr>
+    <tr><td>长上下文（128K+）可行</td><td>无连续预留，只按需分配</td></tr>
+  </tbody>
+</table>
+
+<p>下一页：<a href="06-kv-cache.html">KV Cache 与 Prefix Caching</a>——看看这些块在引擎里是怎么管理的。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

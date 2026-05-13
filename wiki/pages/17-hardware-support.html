@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>硬件后端支持 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 硬件后端支持">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="hardware-support">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>硬件后端支持</h1>
+<p class="page-meta"><span>⚡ 性能 · 17/22</span></p>
+
+<h2>支持矩阵概览</h2>
+<table>
+  <thead><tr><th>硬件</th><th>主要后端</th><th>FP8</th><th>FlashAttention</th><th>多卡并行</th></tr></thead>
+  <tbody>
+    <tr><td>NVIDIA H100 / H200 / B200 (Hopper / Blackwell)</td><td>CUDA / cuBLAS / FlashAttn 3 / FlashInfer / Triton</td><td>✅</td><td>✅ (FA3)</td><td>TP/PP/EP/DP</td></tr>
+    <tr><td>NVIDIA A100 / A40 (Ampere)</td><td>CUDA / FlashAttn 2 / FlashInfer / Triton</td><td>❌ (软件可模拟)</td><td>✅ (FA2)</td><td>TP/PP/EP/DP</td></tr>
+    <tr><td>NVIDIA RTX 40 / 30 系列</td><td>CUDA / FA2 / Triton</td><td>❌</td><td>✅</td><td>TP（单机多卡）</td></tr>
+    <tr><td>AMD MI300X / MI250 (ROCm)</td><td>HIP / Composable Kernel / Triton / quickreduce</td><td>✅ (MI300)</td><td>✅</td><td>TP/PP/EP</td></tr>
+    <tr><td>Intel Xeon (CPU)</td><td>oneDNN / AMX / AVX512</td><td>—</td><td>自研 attention</td><td>NUMA 内并行</td></tr>
+    <tr><td>Intel GPU (PVC / ARC)</td><td>XPU / oneAPI</td><td>部分</td><td>—</td><td>TP</td></tr>
+    <tr><td>Google TPU v4/v5</td><td>PyTorch/XLA</td><td>—</td><td>JAX/XLA 等价实现</td><td>SPMD</td></tr>
+    <tr><td>AWS Trainium / Inferentia</td><td>Neuron SDK</td><td>—</td><td>Neuron Kernel</td><td>TP</td></tr>
+    <tr><td>Intel Gaudi 2/3 (HPU)</td><td>vLLM HPU Plugin</td><td>—</td><td>—</td><td>TP</td></tr>
+    <tr><td>IBM Spyre</td><td>Plugin</td><td>—</td><td>—</td><td>—</td></tr>
+    <tr><td>Huawei Ascend (NPU)</td><td>Plugin</td><td>—</td><td>—</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<p>表格仅作粗略指引；真实支持以最新 release notes 为准。</p>
+
+<h2>抽象：Platform + Attention Backend</h2>
+<ul>
+  <li><code>vllm/platforms/</code>：每个硬件平台一个 Platform 类，决定默认 dtype、是否支持 cuda graph、
+    可用的 attention backend 等。</li>
+  <li><code>vllm/attention/backends/</code> / <code>vllm/v1/attention/backends/</code>：
+    每个 backend（FlashAttention2/3, FlashInfer, XFormers, Triton, ROCm, CPU, TPU…）一个实现。</li>
+  <li>启动时通过 <code>VLLM_ATTENTION_BACKEND</code> 或自动选择。</li>
+</ul>
+
+<h2>插件化后端</h2>
+<p>不是所有硬件都进主仓——Gaudi、Spyre、Ascend 等通过<strong>插件包</strong>维护：</p>
+<ul>
+  <li>装 <code>pip install vllm-hpu</code>（举例），它会通过 vLLM 的 plugin 机制注册一个新 Platform。</li>
+  <li>主仓变化时各 plugin 同步迭代。</li>
+</ul>
+<p>开发者文档：<code>docs/design/plugin_system.md</code>。</p>
+
+<h2>选硬件的几个 thumb rule</h2>
+<ul>
+  <li><strong>新部署 + 长上下文 / 大模型</strong>：H100/H200/B200 + FP8，几乎是性价比最高路径。</li>
+  <li><strong>已有 A100 集群</strong>：用 AWQ / GPTQ + FA2，仍能跑得非常好。</li>
+  <li><strong>AMD MI300X</strong>：单卡显存 192GB，跑 70B/100B+ 单卡可行；ROCm 生态正在快速追赶。</li>
+  <li><strong>纯 CPU 推理</strong>：Xeon + AMX 在小模型 / 离线后处理场景可行；不要拿来扛在线流量。</li>
+  <li><strong>TPU</strong>：在 GCP 上吞吐价格比有时优于 NVIDIA，但生态更窄。</li>
+</ul>
+
+<h2>多硬件混合？</h2>
+<p>vLLM 默认<strong>不</strong>支持单实例里混不同硬件；要混合，通常做"前端路由 + 多实例"。</p>
+
+<p>下一页：<a href="18-benchmarking.html">基准与调优</a>——把"快"量化出来。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

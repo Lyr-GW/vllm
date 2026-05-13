@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>整体架构 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 整体架构">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="architecture">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>整体架构</h1>
+<p class="page-meta"><span>📖 入门 · 2/22</span></p>
+
+<p>本页用一张图 + 一组列表把 vLLM 的整体架构讲清楚，并解释 V0 与 V1 两套实现的差异。</p>
+
+<h2>三层入口</h2>
+<p>无论以哪种方式使用 vLLM，调用链最终都汇入同一个引擎核心。从用户视角看，有三种入口：</p>
+<ol>
+  <li><strong>离线推理</strong>：在 Python 里直接构造 <code>LLM(...)</code> 对象，同步调用 <code>generate()</code> 或 <code>chat()</code>。</li>
+  <li><strong>异步推理</strong>：<code>AsyncLLM</code>（V1） / <code>AsyncLLMEngine</code>（V0），返回异步迭代器，适合在自己的服务端嵌入。</li>
+  <li><strong>HTTP 服务</strong>：<code>vllm serve</code> 启动一个 FastAPI 进程，对外暴露 OpenAI 兼容 REST/SSE 接口。</li>
+</ol>
+
+<h2>核心组件分层</h2>
+
+<div class="mermaid">
+flowchart TB
+  subgraph Frontend["用户入口"]
+    A1["LLM(同步)"]
+    A2["AsyncLLM(异步)"]
+    A3["OpenAI 兼容 HTTP Server"]
+  end
+  subgraph Engine["引擎核心 (vllm/engine, vllm/v1/engine)"]
+    B1[LLMEngine / EngineCore]
+    B2[Scheduler]
+    B3[KV Cache Manager]
+  end
+  subgraph Exec["执行层 (vllm/executor, vllm/v1/executor)"]
+    C1[UniprocExecutor]
+    C2[MultiprocExecutor]
+    C3[RayDistributedExecutor]
+  end
+  subgraph Worker["Worker (vllm/worker, vllm/v1/worker)"]
+    D1[ModelRunner]
+    D2[Attention Backend]
+    D3[Custom CUDA Ops / csrc]
+  end
+  A1 --> B1
+  A2 --> B1
+  A3 --> B1
+  B1 --> B2 --> B1
+  B2 --> B3
+  B1 --> C1 & C2 & C3
+  C1 --> D1
+  C2 --> D1
+  C3 --> D1
+  D1 --> D2 --> D3
+</div>
+
+<p>关键模块在仓库中的位置：</p>
+<table>
+  <thead><tr><th>模块</th><th>V0 路径</th><th>V1 路径</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td>引擎</td><td><code>vllm/engine/llm_engine.py</code></td><td><code>vllm/v1/engine/</code></td><td>请求生命周期、token 流水</td></tr>
+    <tr><td>调度</td><td><code>vllm/core/scheduler.py</code></td><td><code>vllm/v1/core/sched/</code></td><td>选择本步要跑的 seq</td></tr>
+    <tr><td>KV 管理</td><td><code>vllm/core/block_manager*.py</code></td><td><code>vllm/v1/core/kv_cache_manager.py</code></td><td>块表、Prefix Cache</td></tr>
+    <tr><td>Executor</td><td><code>vllm/executor/</code></td><td><code>vllm/v1/executor/</code></td><td>启动 Worker 进程</td></tr>
+    <tr><td>Worker</td><td><code>vllm/worker/</code></td><td><code>vllm/v1/worker/</code></td><td>持有权重、跑前向</td></tr>
+    <tr><td>Attention</td><td><code>vllm/attention/backends/</code></td><td><code>vllm/v1/attention/backends/</code></td><td>FlashAttention / FlashInfer / XFormers</td></tr>
+    <tr><td>模型</td><td colspan="2"><code>vllm/model_executor/models/</code></td><td>各模型 forward 定义</td></tr>
+    <tr><td>分布式</td><td colspan="2"><code>vllm/distributed/</code></td><td>TP / PP / EP 通信</td></tr>
+    <tr><td>入口 server</td><td colspan="2"><code>vllm/entrypoints/openai/</code></td><td>FastAPI app, 路由</td></tr>
+  </tbody>
+</table>
+
+<h2>一次请求的生命周期</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant U as 用户
+  participant API as OpenAI Server
+  participant E as EngineCore
+  participant S as Scheduler
+  participant W as Worker(s)
+  U->>API: POST /v1/chat/completions
+  API->>E: add_request(prompt, params)
+  loop 每个 iteration
+    E->>S: schedule()
+    S-->>E: 本步要跑的 seq + KV block 指派
+    E->>W: execute_model(batch)
+    W-->>E: sampled tokens (logits→sample)
+    E->>API: stream/aggregate output
+  end
+  API-->>U: SSE / JSON 响应
+</div>
+
+<h2>V0 vs V1</h2>
+<p>V1 是 2025 年 1 月发布的<strong>架构级重写</strong>，目标是更干净、更快、更易扩展。要点：</p>
+<ul>
+  <li><strong>统一执行循环</strong>：prefill 与 decode 用同一个 <code>execute_model</code> 路径，
+    chunked prefill 不再是特例。</li>
+  <li><strong>零开销 Prefix Caching</strong>：缓存命中检查的成本被压低到接近 0，
+    日常负载下默认开启不会变慢。</li>
+  <li><strong>Process-isolated EngineCore</strong>：API 进程 ↔ 引擎进程之间用 ZMQ 通信，
+    避免 GIL 影响调度。</li>
+  <li><strong>整洁的 KV Cache 抽象</strong>：通过 <code>kv_cache_interface.py</code> 描述每层的需求，
+    支持 hybrid（如 Mamba+Attention 混合）。</li>
+  <li><strong>更现代的 torch.compile / CUDA Graph 集成</strong>：默认更激进，
+    详见 <a href="16-cuda-graph-compile.html">CUDA Graph & torch.compile</a>。</li>
+</ul>
+
+<p>V0 仍在仓库中保留以兼容老硬件 / 老路径，但<strong>新功能优先落在 V1</strong>，本 Wiki 也以 V1 为主线讲解。</p>
+
+<h2>建议的学习顺序</h2>
+<ol>
+  <li>先看 <a href="03-installation.html">安装</a> + <a href="04-quickstart.html">快速上手</a>，跑通离线和在线两种用法。</li>
+  <li>读 <a href="05-paged-attention.html">PagedAttention</a> 与 <a href="06-kv-cache.html">KV Cache</a> 理解性能来源。</li>
+  <li>用 <a href="08-scheduler.html">调度器</a> + <a href="07-continuous-batching.html">连续批处理</a> 串起一次推理的全流程。</li>
+  <li>按需翻阅 <a href="09-quantization.html">量化</a>、<a href="10-parallelism.html">分布式</a>、<a href="11-speculative-decoding.html">投机解码</a> 等专题。</li>
+  <li>遇到问题查 <a href="21-faq.html">FAQ</a>，看不懂的英文术语翻 <a href="22-glossary.html">术语表</a>。</li>
+</ol>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

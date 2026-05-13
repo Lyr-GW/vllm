@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>贡献指南 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 贡献指南">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="contributing">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>贡献指南</h1>
+<p class="page-meta"><span>📚 参考 · 20/22</span></p>
+
+<p>欢迎给 vLLM 提 PR！下面把流程梳理一遍。</p>
+
+<h2>1. 开发环境</h2>
+<pre><code class="language-bash">git clone https://github.com/vllm-project/vllm.git
+cd vllm
+pip install -e . --no-build-isolation
+pip install -r requirements/dev.txt
+pre-commit install</code></pre>
+
+<p>项目使用一组代码规范工具，<code>pre-commit</code> 会在每次提交前自动跑：</p>
+<ul>
+  <li><strong>yapf</strong> / <strong>ruff</strong>：Python 风格</li>
+  <li><strong>clang-format</strong>：C++/CUDA 风格（见 <code>.clang-format</code>）</li>
+  <li><strong>shellcheck</strong>：Shell 脚本</li>
+  <li><strong>markdownlint</strong>：Markdown 文档</li>
+  <li><strong>codespell</strong> / <strong>mypy</strong>：拼写 / 类型检查（部分目录）</li>
+</ul>
+
+<h2>2. DCO 签名</h2>
+<p>vLLM 要求每个 commit 包含一个 <a href="https://developercertificate.org/" target="_blank" rel="noopener">Developer Certificate of Origin</a> 签名（不是 CLA）：</p>
+<pre><code class="language-bash">git commit -s -m "feat: ..."   # 会自动加 "Signed-off-by: 你 &lt;email&gt;"</code></pre>
+
+<h2>3. 提 PR</h2>
+<ol>
+  <li>从 <code>main</code> 切分支：<code>git checkout -b feat/awesome</code>。</li>
+  <li>本地跑相关单元测试：<code>pytest tests/path/to/your/test.py</code>。</li>
+  <li>用 <a href="04-quickstart.html">快速上手</a> 里的命令做一次 smoke：跑通离线 / 在线请求。</li>
+  <li>PR 标题用 <code>[Feature]</code> / <code>[Bugfix]</code> / <code>[Doc]</code> 等前缀，清楚描述动机与影响范围。</li>
+  <li>主动指明会触发的 CI label（如 <code>ci/build</code>、<code>kernel/marlin</code>），加速调度。</li>
+</ol>
+
+<h2>4. CI 系统</h2>
+<p>vLLM 用 Buildkite 作为主 CI（<code>.buildkite/</code>），覆盖：</p>
+<ul>
+  <li>多 GPU 测试（A100、L4 等）</li>
+  <li>多硬件平台（CPU、ROCm 等通过插件 fork 单独跑）</li>
+  <li>构建 wheels / docker images</li>
+</ul>
+<p>对 contributor 不可见的私有 CI 部分由维护者跑。提交前用 <code>tools/ci/...</code> 里的脚本本地检查。</p>
+
+<h2>5. 加新模型</h2>
+<p>典型步骤：</p>
+<ol>
+  <li>在 <code>vllm/model_executor/models/</code> 新建 <code>my_model.py</code>，
+    继承现有 <code>LlamaForCausalLM</code> 或写新的 forward。</li>
+  <li>实现 <code>load_weights</code>、<code>compute_logits</code> 等方法，
+    与 HuggingFace 的权重命名对齐。</li>
+  <li>在 <code>vllm/model_executor/models/registry.py</code> 注册。</li>
+  <li>添加单测：<code>tests/models/test_my_model.py</code>。</li>
+  <li>更新 <code>docs/models/supported_models.md</code>。</li>
+</ol>
+<p>详见 <code>docs/contributing/model/</code> 下的子目录。</p>
+
+<h2>6. 加新硬件</h2>
+<p>通常作为<strong>插件包</strong>而非主仓 PR，参考 Gaudi / Spyre / Ascend 的 plugin 仓库。
+插件机制见 <code>docs/design/plugin_system.md</code>。</p>
+
+<h2>7. 写文档</h2>
+<p>文档源在 <code>docs/</code>，用 mkdocs-material。本地：</p>
+<pre><code class="language-bash">pip install -r requirements/docs.txt
+mkdocs serve</code></pre>
+
+<h2>8. 行为准则与协议</h2>
+<ul>
+  <li>遵循 <code>CODE_OF_CONDUCT.md</code>。</li>
+  <li>代码遵循 <strong>Apache-2.0</strong>。</li>
+  <li>安全问题请通过 GitHub Security Advisory 私下报告（见 <code>SECURITY.md</code>）。</li>
+</ul>
+
+<p>祝你 PR 顺利 👋。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

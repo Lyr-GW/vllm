@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>投机解码 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 投机解码">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="speculative-decoding">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>投机解码</h1>
+<p class="page-meta"><span>🚀 关键特性 · 11/22</span></p>
+
+<h2>动机</h2>
+<p>Decode 阶段是<strong>memory-bound</strong>：每生成一个 token 都得把整模型权重从 HBM 搬到 SRAM。
+如果能"一次性生成多个 token"，单步收益就成倍提升。投机解码（Speculative Decoding）就是干这件事：
+让一个<strong>便宜的 draft 模型</strong>预测后 N 个 token，然后让目标大模型一次性<strong>批量验证</strong>。</p>
+
+<h2>基本流程</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant D as Draft 模型(小)
+  participant T as Target 模型(大)
+  D->>D: 生成 k 个候选 token t1..tk
+  D->>T: 把 [prompt, t1..tk] 一次前向
+  T-->>T: 对每个位置算自己的概率
+  Note over T: 从左到右逐个接受/拒绝
+  T-->>D: 接受 m 个 token(0 ≤ m ≤ k), 第 m+1 个用 T 的 token 覆盖
+</div>
+
+<p>关键性质：接受/拒绝过程使用<strong>重要性采样</strong>，
+保证最终分布与"完全用 target 自回归生成"<strong>完全等价</strong>——投机解码<strong>不损精度</strong>，
+是无损加速。</p>
+
+<h2>vLLM 支持的算法</h2>
+<table>
+  <thead><tr><th>算法</th><th>Draft 来源</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>N-gram</td><td>从 prompt 中抽取常见 n-gram</td><td>零额外参数，适合长重复模板</td></tr>
+    <tr><td>独立小模型</td><td>另一个 LM（如 1B / 3B 同家族）</td><td>通用最稳，需多放一份权重</td></tr>
+    <tr><td><strong>Medusa</strong></td><td>主模型加多个"输出头"</td><td>不需要单独模型，吞吐增益中等</td></tr>
+    <tr><td><strong>EAGLE</strong> / EAGLE-3</td><td>主模型 hidden state 上的轻量 draft net</td><td>当下精度/吞吐最好的方案之一</td></tr>
+    <tr><td>MLPSpeculator</td><td>多头 MLP 推测</td><td>IBM 提出，简单</td></tr>
+  </tbody>
+</table>
+
+<h2>命令行示例</h2>
+<pre><code class="language-bash"># 独立小模型
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+  --speculative-config '{
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "num_speculative_tokens": 5
+  }'
+
+# N-gram
+vllm serve &lt;model&gt; \
+  --speculative-config '{"method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}'
+
+# EAGLE
+vllm serve &lt;target&gt; \
+  --speculative-config '{
+    "method": "eagle",
+    "model": "&lt;eagle-head-checkpoint&gt;",
+    "num_speculative_tokens": 5
+  }'</code></pre>
+
+<h2>实际收益取决于"接受率"</h2>
+<p>记单步候选数 = <em>k</em>，接受率（每候选被采纳的概率）= <em>α</em>，则平均每步实际产出
+<em>1 + αk</em> 个 token。但每步成本变成<strong>"draft 算力 + target 一次 k+1 长度的前向"</strong>。</p>
+<p>所以投机解码并不总是赢：</p>
+<ul>
+  <li>α 低时（draft 与 target 风格差太多），可能负收益；</li>
+  <li>k 太大时，目标模型的"批"会变胖，单步反而慢；</li>
+  <li>高并发 batch 下，target 本身已经在大批跑了，draft 引入的串行约束会限制吞吐。</li>
+</ul>
+
+<div class="callout info">
+  <span class="callout-title">经验值</span>
+  <p>通用对话：k=3~5，期望加速 1.3×~1.8×；编码 / 模板化输出：k=5~8，可见 2× 以上；
+  与同家族 1B 作 draft 通常优于跨家族；强烈建议先用 <code>benchmark_serving.py</code> 实测。</p>
+</div>
+
+<h2>源码位置</h2>
+<ul>
+  <li>V1：<code>vllm/v1/spec_decode/</code>（draft runner、proposer、verifier）。</li>
+  <li>EAGLE、Medusa 的特殊 head：<code>vllm/model_executor/models/eagle*.py</code> 等。</li>
+</ul>
+
+<h2>排障 checklist</h2>
+<ul>
+  <li>开关后吞吐反而下降 → 用 <code>num_speculative_tokens=1</code> 试，再逐步加。</li>
+  <li>接受率长期低于 30% → 换更同源的 draft 模型；或改用 EAGLE。</li>
+  <li>显存爆 → draft 模型也占显存，记得预留。</li>
+</ul>
+
+<p>下一页：<a href="12-lora.html">LoRA 多适配器</a>——一份基座、多份能力。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

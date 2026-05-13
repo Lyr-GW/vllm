@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>源码目录速查 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 源码目录速查">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="source-tree">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>源码目录速查</h1>
+<p class="page-meta"><span>📚 参考 · 19/22</span></p>
+
+<p>当你想"改某个特性"或"看某段实现"时，这一页帮你快速找到入口。
+所有路径相对仓库根。</p>
+
+<h2>顶层结构</h2>
+<table>
+  <thead><tr><th>目录 / 文件</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm/</code></td><td>Python 主源码</td></tr>
+    <tr><td><code>csrc/</code></td><td>CUDA / HIP / CPU 自定义算子</td></tr>
+    <tr><td><code>docs/</code></td><td>官方文档（mkdocs）</td></tr>
+    <tr><td><code>benchmarks/</code></td><td>性能基准脚本</td></tr>
+    <tr><td><code>examples/</code></td><td>离线 / 在线示例</td></tr>
+    <tr><td><code>tests/</code></td><td>pytest 测试</td></tr>
+    <tr><td><code>tools/</code></td><td>构建、CI、release 工具</td></tr>
+    <tr><td><code>requirements/</code></td><td>各平台依赖锁文件</td></tr>
+    <tr><td><code>docker/</code></td><td>各类 Dockerfile</td></tr>
+    <tr><td><code>cmake/</code></td><td>CMake 辅助脚本</td></tr>
+    <tr><td><code>setup.py</code> / <code>CMakeLists.txt</code> / <code>pyproject.toml</code></td><td>构建入口</td></tr>
+    <tr><td><code>.buildkite/</code></td><td>CI 流水线（Buildkite YAML）</td></tr>
+  </tbody>
+</table>
+
+<h2><code>vllm/</code> 子模块</h2>
+<table>
+  <thead><tr><th>子目录</th><th>描述</th></tr></thead>
+  <tbody>
+    <tr><td><code>engine/</code></td><td>V0 引擎（<code>LLMEngine</code>、<code>AsyncLLMEngine</code>）</td></tr>
+    <tr><td><code>v1/</code></td><td>V1 重写：<code>engine/</code>, <code>core/</code>, <code>worker/</code>, <code>attention/</code>, <code>executor/</code>, <code>spec_decode/</code>, <code>sample/</code> …</td></tr>
+    <tr><td><code>core/</code></td><td>V0 调度器、block manager</td></tr>
+    <tr><td><code>attention/</code></td><td>各 attention backend + 算子封装</td></tr>
+    <tr><td><code>model_executor/</code></td><td>模型实现、layer、采样、量化层</td></tr>
+    <tr><td><code>distributed/</code></td><td>TP / PP / EP 通信原语，custom all-reduce 绑定</td></tr>
+    <tr><td><code>executor/</code></td><td>多进程 / Ray Executor</td></tr>
+    <tr><td><code>worker/</code></td><td>V0 Worker (ModelRunner, CacheEngine)</td></tr>
+    <tr><td><code>entrypoints/</code></td><td>命令行 + OpenAI 兼容 HTTP server</td></tr>
+    <tr><td><code>lora/</code></td><td>LoRA 加载、调度、kernels 调用</td></tr>
+    <tr><td><code>multimodal/</code></td><td>图像/视频/音频处理器与缓存</td></tr>
+    <tr><td><code>compilation/</code></td><td>torch.compile / CUDA Graph 封装</td></tr>
+    <tr><td><code>config/</code></td><td>所有可配置项（与命令行一一对应）</td></tr>
+    <tr><td><code>transformers_utils/</code></td><td>tokenizer / chat template 适配</td></tr>
+    <tr><td><code>reasoning/</code></td><td>reasoning 输出解析（DeepSeek-R1 等）</td></tr>
+    <tr><td><code>plugins/</code></td><td>插件框架</td></tr>
+    <tr><td><code>platforms/</code></td><td>每个硬件平台的 Platform 实现</td></tr>
+    <tr><td><code>third_party/</code></td><td>第三方库（如 vendored 部分）</td></tr>
+  </tbody>
+</table>
+
+<h2><code>csrc/</code> 子模块</h2>
+<table>
+  <thead><tr><th>子目录</th><th>描述</th></tr></thead>
+  <tbody>
+    <tr><td><code>attention/</code></td><td>Paged Attention CUDA kernels</td></tr>
+    <tr><td><code>cache_kernels.cu</code></td><td>KV cache copy/swap</td></tr>
+    <tr><td><code>moe/</code></td><td>Fused MoE / all-to-all 辅助</td></tr>
+    <tr><td><code>quantization/</code></td><td>GPTQ / AWQ / FP8 / INT8 GEMM</td></tr>
+    <tr><td><code>cutlass_extensions/</code></td><td>基于 CUTLASS 的 GEMM 模板</td></tr>
+    <tr><td><code>mamba/</code></td><td>SSM / Mamba 算子</td></tr>
+    <tr><td><code>cpu/</code></td><td>CPU 后端实现</td></tr>
+    <tr><td><code>rocm/</code></td><td>ROCm 特定实现</td></tr>
+    <tr><td><code>custom_all_reduce.cu(h)</code></td><td>小消息低延迟 all-reduce</td></tr>
+    <tr><td><code>quickreduce/</code></td><td>AMD 量化通信</td></tr>
+    <tr><td><code>sparse/</code></td><td>稀疏 / 块稀疏</td></tr>
+    <tr><td><code>torch_bindings.cpp</code></td><td>把 C++ 算子注册成 torch op</td></tr>
+  </tbody>
+</table>
+
+<h2>"我想改 xxx，去哪改"</h2>
+<table>
+  <thead><tr><th>需求</th><th>入口</th></tr></thead>
+  <tbody>
+    <tr><td>加一个新模型</td><td><code>vllm/model_executor/models/&lt;your_model&gt;.py</code> + 注册到 <code>__init__.py</code></td></tr>
+    <tr><td>加一个新量化方法</td><td><code>vllm/model_executor/layers/quantization/</code> + <code>csrc/quantization/</code></td></tr>
+    <tr><td>加一个新 attention backend</td><td><code>vllm/v1/attention/backends/</code></td></tr>
+    <tr><td>改调度策略</td><td><code>vllm/v1/core/sched/scheduler.py</code></td></tr>
+    <tr><td>改 KV 管理 / Prefix Cache</td><td><code>vllm/v1/core/kv_cache_manager.py</code></td></tr>
+    <tr><td>加一个新 OpenAI 端点</td><td><code>vllm/entrypoints/openai/</code></td></tr>
+    <tr><td>加一个工具调用 parser</td><td><code>vllm/entrypoints/openai/tool_parsers/</code></td></tr>
+    <tr><td>支持新硬件</td><td><code>vllm/platforms/</code> + 对应 attention backend + 必要时插件包</td></tr>
+    <tr><td>加 reasoning parser</td><td><code>vllm/reasoning/</code></td></tr>
+    <tr><td>加 logits processor 插件</td><td><code>vllm/plugins/</code> 或 <code>SamplingParams.logits_processors</code></td></tr>
+  </tbody>
+</table>
+
+<p>继续：<a href="20-contributing.html">贡献指南</a>。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

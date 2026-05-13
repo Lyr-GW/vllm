@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>安装与环境 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 安装与环境">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="installation">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>安装与环境</h1>
+<p class="page-meta"><span>📖 入门 · 3/22</span></p>
+
+<h2>三种主流安装方式</h2>
+
+<h3>1. pip（最常用）</h3>
+<pre><code class="language-bash">pip install vllm
+
+# 或指定版本
+pip install "vllm==0.6.4"
+
+# 或额外加上某些可选依赖
+pip install "vllm[audio]"     # 多模态音频
+pip install "vllm[video]"     # 多模态视频
+pip install "vllm[tensorizer]" # tensorizer 加载</code></pre>
+
+<div class="callout info">
+  <span class="callout-title">提示</span>
+  <p>pip 包默认基于<strong>当前 PyPI 上稳定的 PyTorch</strong> 构建。如果你想用自己的
+  PyTorch（例如 nightly 或 ROCm 版），见下面"基于已有 PyTorch 构建"。</p>
+</div>
+
+<h3>2. 源码构建</h3>
+<pre><code class="language-bash">git clone https://github.com/vllm-project/vllm.git
+cd vllm
+pip install -e . --no-build-isolation</code></pre>
+
+<p>构建系统由 <code>setup.py</code> + <code>CMakeLists.txt</code> + <code>cmake/</code> 中的辅助脚本组成，
+会编译 <code>csrc/</code> 下的 CUDA / ROCm / CPU 算子。常见控制变量：</p>
+<table>
+  <thead><tr><th>环境变量</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_TARGET_DEVICE</code></td><td><code>cuda</code> / <code>rocm</code> / <code>cpu</code> / <code>tpu</code> / <code>xpu</code> / <code>neuron</code></td></tr>
+    <tr><td><code>MAX_JOBS</code></td><td>并行编译线程数，避免 OOM</td></tr>
+    <tr><td><code>NVCC_THREADS</code></td><td>每个 nvcc 调用的线程数</td></tr>
+    <tr><td><code>CMAKE_BUILD_TYPE</code></td><td><code>Release</code> / <code>RelWithDebInfo</code> / <code>Debug</code></td></tr>
+    <tr><td><code>TORCH_CUDA_ARCH_LIST</code></td><td>显式指定 SM 架构，如 <code>"8.0;8.6;9.0"</code></td></tr>
+  </tbody>
+</table>
+
+<h4>基于已有 PyTorch 构建</h4>
+<p>仓库提供 <code>use_existing_torch.py</code>，可在依赖里删除对 <code>torch==X.Y.Z</code> 的硬性约束，
+方便你使用本地装好的 PyTorch：</p>
+<pre><code class="language-bash">python use_existing_torch.py
+pip install -e . --no-build-isolation</code></pre>
+
+<h3>3. Docker</h3>
+<p><code>docker/</code> 目录下有官方 Dockerfile（GPU、CPU、ROCm 等）。最简单的方式：</p>
+<pre><code class="language-bash">docker run --runtime nvidia --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8000:8000 \
+  --ipc=host \
+  vllm/vllm-openai:latest \
+  --model meta-llama/Llama-3.1-8B-Instruct</code></pre>
+
+<h2>硬件 / 驱动要求</h2>
+<table>
+  <thead><tr><th>平台</th><th>最低要求</th><th>推荐</th></tr></thead>
+  <tbody>
+    <tr><td>NVIDIA</td><td>SM 7.0（Volta）、CUDA 12.x、Driver ≥ 525</td><td>SM 8.0+（A100 / H100 / B200），CUDA 12.4+</td></tr>
+    <tr><td>AMD</td><td>ROCm 6.x、MI200/MI300</td><td>MI300X + ROCm 最新</td></tr>
+    <tr><td>Intel GPU</td><td>PVC（Ponte Vecchio）/ ARC，oneAPI</td><td>—</td></tr>
+    <tr><td>Intel CPU</td><td>AVX512-VNNI / AMX-BF16</td><td>Xeon SPR / EMR</td></tr>
+    <tr><td>TPU</td><td>v4 / v5e / v5p，PyTorch/XLA</td><td>—</td></tr>
+    <tr><td>Apple Silicon</td><td>不支持作为推理后端</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<h2>Python 依赖</h2>
+<p>关键依赖（节选自 <code>requirements/</code>）：</p>
+<ul>
+  <li><code>torch</code>（版本随每个 vLLM release 锁定）</li>
+  <li><code>transformers</code>、<code>tokenizers</code>、<code>huggingface_hub</code></li>
+  <li><code>xformers</code>（部分 backend）/ <code>flashinfer-python</code></li>
+  <li><code>fastapi</code> + <code>uvicorn</code> + <code>aiohttp</code>（OpenAI server）</li>
+  <li><code>ray</code>（多机分布式）</li>
+  <li><code>outlines</code> / <code>xgrammar</code>（结构化输出）</li>
+</ul>
+
+<h2>常见安装坑</h2>
+<div class="callout warn">
+  <span class="callout-title">编译时 OOM</span>
+  <p>nvcc 单文件可能吃掉 8-12GB 内存。把 <code>MAX_JOBS</code> 调小（如 <code>MAX_JOBS=4</code>）通常能解决。</p>
+</div>
+<div class="callout warn">
+  <span class="callout-title">CUDA driver 与 runtime 不匹配</span>
+  <p>vLLM 报 <code>CUDA error: forward compatibility was attempted on non supported HW</code> 时，
+    通常是 <code>nvidia-smi</code> 里的驱动版本低于 wheel 编译时的 CUDA 版本。升级驱动或换匹配的 wheel。</p>
+</div>
+<div class="callout warn">
+  <span class="callout-title">显存够，但启动 OOM</span>
+  <p>vLLM 默认会"占用 90%"的显存（<code>--gpu-memory-utilization 0.9</code>）来预分配 KV Cache。
+    如果你机器上还有别的进程，把它降到 <code>0.8</code> 或更低。</p>
+</div>
+<div class="callout warn">
+  <span class="callout-title">Linux 共享内存不足</span>
+  <p>容器里多进程模型并行会用到 <code>/dev/shm</code>；启动 docker 时务必加 <code>--ipc=host</code> 或 <code>--shm-size=8g</code>。</p>
+</div>
+
+<h2>验证安装</h2>
+<pre><code class="language-bash">python -c "import vllm; print(vllm.__version__)"
+python -m vllm collect_env</code></pre>
+<p><code>collect_env</code> 会打印 GPU、驱动、CUDA、PyTorch、关键依赖版本，是提 issue 必备。</p>
+
+<p>装好之后，进入 <a href="04-quickstart.html">快速上手</a> 跑第一条请求。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

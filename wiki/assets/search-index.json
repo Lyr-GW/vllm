@@ -1,0 +1,140 @@
+[
+  {
+    "title": "首页 · vLLM Wiki",
+    "url": "index.html",
+    "summary": "vLLM 中文 Wiki 总入口：架构、原理、特性、API、性能。",
+    "keywords": ["vllm", "wiki", "首页", "总览", "home", "index"]
+  },
+  {
+    "title": "项目简介",
+    "url": "pages/01-introduction.html",
+    "summary": "vLLM 是什么、出身、解决了哪些问题以及核心能力一览。",
+    "keywords": ["简介", "introduction", "项目", "vllm", "berkeley", "pytorch foundation", "里程碑"]
+  },
+  {
+    "title": "整体架构",
+    "url": "pages/02-architecture.html",
+    "summary": "LLM 引擎、调度器、Worker、Attention 后端的分层结构以及 V0/V1 差异。",
+    "keywords": ["架构", "architecture", "engine", "v1", "executor", "worker", "scheduler", "module map"]
+  },
+  {
+    "title": "安装与环境",
+    "url": "pages/03-installation.html",
+    "summary": "pip / 源码 / Docker 三种安装方式，CUDA/ROCm/CPU 注意事项，常见安装坑。",
+    "keywords": ["安装", "install", "pip", "docker", "源码", "cuda", "rocm", "驱动"]
+  },
+  {
+    "title": "快速上手",
+    "url": "pages/04-quickstart.html",
+    "summary": "第一个离线推理 + 启动一个 OpenAI 兼容服务，常用参数速览。",
+    "keywords": ["quickstart", "快速上手", "LLM", "generate", "vllm serve", "openai"]
+  },
+  {
+    "title": "PagedAttention 原理",
+    "url": "pages/05-paged-attention.html",
+    "summary": "把 KV 缓存按块管理：动机、块表、共享前缀、Copy-on-Write。",
+    "keywords": ["pagedattention", "paged attention", "kv cache", "块表", "block_size", "fragmentation"]
+  },
+  {
+    "title": "KV Cache 与 Prefix Caching",
+    "url": "pages/06-kv-cache.html",
+    "summary": "KV 数据结构、Prefix Cache 哈希索引、淘汰策略、Hybrid KV Manager。",
+    "keywords": ["kv cache", "prefix caching", "前缀缓存", "hybrid kv", "block", "hash", "manager"]
+  },
+  {
+    "title": "连续批处理 & Chunked Prefill",
+    "url": "pages/07-continuous-batching.html",
+    "summary": "iteration-level 调度、prefill/decode 差别、chunked prefill 原理。",
+    "keywords": ["continuous batching", "连续批处理", "chunked prefill", "iteration", "prefill", "decode"]
+  },
+  {
+    "title": "调度器与执行循环",
+    "url": "pages/08-scheduler.html",
+    "summary": "三态队列、抢占（Recompute/Swap）、优先级、调度器与 KV Manager 协作。",
+    "keywords": ["scheduler", "调度器", "preemption", "recompute", "swap", "priority", "waiting", "running"]
+  },
+  {
+    "title": "量化",
+    "url": "pages/09-quantization.html",
+    "summary": "FP8、INT8、GPTQ、AWQ、AutoRound、BitsAndBytes、Marlin/Machete 等量化方案对比与选型。",
+    "keywords": ["quantization", "量化", "fp8", "int8", "gptq", "awq", "autoround", "bitsandbytes", "marlin", "machete", "kv cache dtype"]
+  },
+  {
+    "title": "分布式与并行",
+    "url": "pages/10-parallelism.html",
+    "summary": "TP / PP / DP / EP / SP 五种并行维度的原理、组合与排障。",
+    "keywords": ["分布式", "并行", "tensor parallelism", "pipeline parallelism", "data parallelism", "expert parallelism", "sequence parallelism", "ray", "nccl", "tp", "pp", "ep"]
+  },
+  {
+    "title": "投机解码",
+    "url": "pages/11-speculative-decoding.html",
+    "summary": "Draft + Target 模型协作，N-gram / Medusa / EAGLE 等方案与接受率分析。",
+    "keywords": ["speculative decoding", "投机解码", "draft", "eagle", "medusa", "ngram", "n-gram", "mlpspeculator"]
+  },
+  {
+    "title": "LoRA 多适配器",
+    "url": "pages/12-lora.html",
+    "summary": "一份基座、多份 LoRA 同时在 batch 内调度，动态加载/卸载。",
+    "keywords": ["lora", "adapter", "适配器", "punica", "qlora", "max-loras"]
+  },
+  {
+    "title": "多模态",
+    "url": "pages/13-multimodal.html",
+    "summary": "图像 / 视频 / 音频的统一抽象，主流多模态模型与调用方式。",
+    "keywords": ["multimodal", "多模态", "llava", "qwen-vl", "internvl", "pixtral", "vision", "audio", "whisper"]
+  },
+  {
+    "title": "OpenAI 兼容 API",
+    "url": "pages/14-api-server.html",
+    "summary": "endpoint 一览、流式 SSE、工具调用、reasoning 输出、Prometheus 指标。",
+    "keywords": ["openai", "api", "chat completions", "tool calling", "function calling", "reasoning", "metrics", "sse", "stream"]
+  },
+  {
+    "title": "采样与结构化输出",
+    "url": "pages/15-sampling.html",
+    "summary": "SamplingParams、Guided JSON/Regex/Choice/Grammar、自定义 LogitsProcessor。",
+    "keywords": ["sampling", "采样", "temperature", "top_p", "guided json", "结构化输出", "outlines", "xgrammar", "logits processor", "beam search"]
+  },
+  {
+    "title": "CUDA Graph & torch.compile",
+    "url": "pages/16-cuda-graph-compile.html",
+    "summary": "为什么用 CUDA Graph、vLLM 的 bucket 捕获策略、torch.compile 集成。",
+    "keywords": ["cuda graph", "torch.compile", "compile", "inductor", "triton", "enforce-eager", "kernel launch"]
+  },
+  {
+    "title": "硬件后端支持",
+    "url": "pages/17-hardware-support.html",
+    "summary": "NVIDIA / AMD / Intel / TPU / Gaudi / Spyre / Ascend 等后端支持矩阵。",
+    "keywords": ["hardware", "硬件", "nvidia", "amd", "rocm", "intel", "tpu", "gaudi", "spyre", "ascend", "neuron", "platform"]
+  },
+  {
+    "title": "基准与调优",
+    "url": "pages/18-benchmarking.html",
+    "summary": "TTFT / TPOT / ITL / Throughput 等指标，调优 checklist 与 profiling。",
+    "keywords": ["benchmark", "基准", "调优", "ttft", "tpot", "itl", "throughput", "goodput", "profiler", "nsys"]
+  },
+  {
+    "title": "源码目录速查",
+    "url": "pages/19-source-tree.html",
+    "summary": "顶层结构、vllm/ 与 csrc/ 子模块、'我想改 xxx 去哪改' 索引。",
+    "keywords": ["源码", "目录", "source tree", "structure", "csrc", "vllm package"]
+  },
+  {
+    "title": "贡献指南",
+    "url": "pages/20-contributing.html",
+    "summary": "开发环境、DCO、PR 流程、CI、加新模型 / 新硬件、文档。",
+    "keywords": ["contributing", "贡献", "pre-commit", "dco", "pull request", "buildkite", "ci", "new model"]
+  },
+  {
+    "title": "常见问答 FAQ",
+    "url": "pages/21-faq.html",
+    "summary": "显存、性能、TP 加速、NCCL、CUDA Graph、集成等常见问题。",
+    "keywords": ["faq", "常见问题", "oom", "显存", "ttft", "nccl", "openwebui", "langchain"]
+  },
+  {
+    "title": "术语表",
+    "url": "pages/22-glossary.html",
+    "summary": "PagedAttention、KV、TP/PP/EP、LoRA、FP8、Prefix Cache、Spec Decode 等术语。",
+    "keywords": ["glossary", "术语", "ttft", "tpot", "itl", "kv cache", "pagedattention", "lora", "fp8", "mo e"]
+  }
+]

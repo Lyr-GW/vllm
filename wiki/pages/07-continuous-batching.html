@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>连续批处理 & Chunked Prefill — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 连续批处理 & Chunked Prefill">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="continuous-batching">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>连续批处理 &amp; Chunked Prefill</h1>
+<p class="page-meta"><span>🧠 核心原理 · 7/22</span></p>
+
+<h2>为什么不能像训练那样批处理</h2>
+<p>训练时一个 batch 内的样本通常等长（或 pad 到等长），一次前向所有样本同步进行。
+推理则完全不同：</p>
+<ul>
+  <li>每条请求<strong>到达时间</strong>不同；</li>
+  <li>每条请求<strong>prompt 长度</strong>不同；</li>
+  <li>每条请求<strong>生成长度</strong>不同；</li>
+  <li>每条请求可能<strong>早停</strong>（遇到 EOS / stop string）。</li>
+</ul>
+<p>用"等齐再批"或"按最大长度 pad"都会浪费 GPU。Continuous Batching（也叫 iteration-level scheduling）
+的核心思想是：<strong>以单步 forward 为单位调度</strong>——每一步开始前，重新挑选一组 sequence 上 GPU。</p>
+
+<h2>Iteration-level 调度示意</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant T as 时间步
+  participant B as 批 (本步)
+  Note over T,B: t=0 入: A(prompt=200), B(prompt=10)
+  T->>B: t=1  prefill A,B
+  Note over T,B: t=1 入: C(prompt=4)
+  T->>B: t=2  decode A,B + prefill C
+  T->>B: t=3  decode A,B,C
+  Note over T,B: t=3  B 命中 EOS, 离开
+  T->>B: t=4  decode A,C
+  Note over T,B: t=4 入: D
+  T->>B: t=5  decode A,C + prefill D
+</div>
+
+<p>这就是 vLLM 的引擎主循环长成的样子：调度器决定本步"谁继续 decode、谁新加进来做 prefill"，
+然后把这一批喂给 worker 跑一次前向。</p>
+
+<h2>prefill 与 decode 的差别</h2>
+<table>
+  <thead><tr><th>阶段</th><th>计算特点</th><th>GPU 角色</th></tr></thead>
+  <tbody>
+    <tr><td>Prefill</td><td>对 prompt 一次性算 K/V，sequence 长度 = prompt 长度</td><td>compute-bound（矩阵乘很大）</td></tr>
+    <tr><td>Decode</td><td>每步只算 1 个新 token，需要把所有历史 K/V 都参与 attention</td><td>memory-bound（搬 KV 是瓶颈）</td></tr>
+  </tbody>
+</table>
+
+<p>没有 chunked prefill 时，一个超长 prompt 进入会"霸占"GPU 整整一步：
+其他 sequence 的 decode 全部要等它 prefill 完才有机会上车。
+体验上就是：<strong>长 prompt 一来，整个集群 TPS 卡顿一下</strong>。</p>
+
+<h2>Chunked Prefill</h2>
+<p>解决方案是把长 prompt 切成多个 chunk，每个 chunk 与正在 decode 的其他 sequence
+<strong>混在同一步</strong>里跑。这样：</p>
+<ul>
+  <li>正在生成的 sequence 不会被卡住，TPOT 更平滑；</li>
+  <li>同一步内同时有 prefill 的"大块矩阵乘"和 decode 的"小批 attention"，GPU 利用率更高。</li>
+</ul>
+
+<div class="mermaid">
+flowchart LR
+  subgraph S[一个超长 prompt, 4096 tokens]
+    P0[chunk #0\n0..1023]
+    P1[chunk #1\n1024..2047]
+    P2[chunk #2\n2048..3071]
+    P3[chunk #3\n3072..4095]
+  end
+  Step1[Step k]   -->|P0 + decodes| GPU
+  Step2[Step k+1] -->|P1 + decodes| GPU
+  Step3[Step k+2] -->|P2 + decodes| GPU
+  Step4[Step k+3] -->|P3 + decodes| GPU
+</div>
+
+<p>每步的 token 总数受 <code>--max-num-batched-tokens</code> 限制。给定该上限，
+调度器会把 prefill 的剩余 token 与 decode 的当前 token "凑"到上限。</p>
+
+<h2>关键参数</h2>
+<table>
+  <thead><tr><th>参数</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>--enable-chunked-prefill</code></td><td>启用（V1 默认开）</td></tr>
+    <tr><td><code>--max-num-batched-tokens</code></td><td>每步 token 上限。值越大，prefill 越快但 decode 受影响</td></tr>
+    <tr><td><code>--max-num-seqs</code></td><td>每步并发序列上限，影响 batch 大小</td></tr>
+    <tr><td><code>--scheduling-policy</code></td><td>FCFS / priority 等</td></tr>
+  </tbody>
+</table>
+
+<h2>常见误区</h2>
+<div class="callout warn">
+  <span class="callout-title">"开了 chunked prefill 反而变慢？"</span>
+  <p>把 <code>--max-num-batched-tokens</code> 设得太小（如 512）会让 prefill 被切得太碎，
+  矩阵乘变小、kernel launch overhead 占比上升。一般保持默认或基于工作负载用
+  <code>benchmark_serving.py</code> 扫一遍。</p>
+</div>
+<div class="callout warn">
+  <span class="callout-title">"为什么我看到 TPS 比官方数字低？"</span>
+  <p>官方数字通常是<strong>持续打流</strong>下的稳态吞吐。短时启动、缓存未热（Prefix Cache 没命中）、
+    或 client 串行发请求都会低估。请用 <code>benchmark_serving.py --request-rate ∞</code> 来测稳态。</p>
+</div>
+
+<h2>它怎样与 PagedAttention 协作</h2>
+<p>Continuous Batching 之所以能用一个 kernel call 跑一个混合 batch（不同 seq 不同长度），
+正是因为 <a href="05-paged-attention.html">PagedAttention</a> 不再要求 K/V 连续。
+两者是 vLLM 的"双引擎"，缺一不可。</p>
+
+<p>下一页：<a href="08-scheduler.html">调度器</a>——把上面这些动作真正串起来的角色。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

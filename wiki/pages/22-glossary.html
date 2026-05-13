@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>术语表 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 术语表">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="glossary">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>术语表</h1>
+<p class="page-meta"><span>📚 参考 · 22/22</span></p>
+
+<p>本表给出本 Wiki 与 vLLM 上下文里反复出现的术语的<strong>中文简释 + 英文标准写法</strong>。
+按字母 / 拼音排序，找不到时直接 <kbd>Ctrl</kbd>+<kbd>F</kbd>。</p>
+
+<h2>A — F</h2>
+<dl>
+  <dt><strong>All-Reduce</strong></dt>
+  <dd>把所有进程的张量求和并广播回每个进程的集合通信原语。vLLM 用 NCCL，
+    也有自研 Custom All-Reduce 用于小消息低延迟。</dd>
+
+  <dt><strong>AutoRound</strong></dt>
+  <dd>一种基于"舍入学习"的极低比特量化方法，常用于 4/3/2-bit。</dd>
+
+  <dt><strong>AWQ</strong> (Activation-aware Weight Quantization)</dt>
+  <dd>4-bit 权重量化方法，按通道选择保留精度高的权重，质量优于纯 GPTQ。</dd>
+
+  <dt><strong>Backend</strong></dt>
+  <dd>vLLM 里 attention/通信/采样等可替换实现。例如 attention backend 有
+    FlashAttention2/3、FlashInfer、XFormers、Triton 等。</dd>
+
+  <dt><strong>Beam Search</strong></dt>
+  <dd>同时保留 k 个最高累积概率的候选，逐步扩展。</dd>
+
+  <dt><strong>Block</strong></dt>
+  <dd>PagedAttention 中 KV 缓存的最小分配单位，默认 16 个 token。</dd>
+
+  <dt><strong>Chunked Prefill</strong></dt>
+  <dd>把长 prompt 的 prefill 切成多块，与正在 decode 的 seq 混 batch。</dd>
+
+  <dt><strong>Continuous Batching</strong></dt>
+  <dd>以 iteration 为单位重新选择 batch 成员，请求随到随入。</dd>
+
+  <dt><strong>Copy-on-Write (CoW)</strong></dt>
+  <dd>共享一个块直到要写入时再拷贝。vLLM 用 CoW 在 beam search / 并行采样里复用前缀块。</dd>
+
+  <dt><strong>CUDA Graph</strong></dt>
+  <dd>把一段固定形状的 GPU 计算"录"成 graph，后续以一次 launch 重放，减少 host 开销。</dd>
+
+  <dt><strong>DCO</strong> (Developer Certificate of Origin)</dt>
+  <dd>提交者声明自己有权贡献代码的轻量协议，<code>git commit -s</code> 自动加。</dd>
+
+  <dt><strong>Decode</strong></dt>
+  <dd>自回归生成阶段：每步仅算 1 个新 token，但需要访问全部历史 K/V。</dd>
+
+  <dt><strong>EAGLE</strong></dt>
+  <dd>一类基于隐藏态的轻量 draft 网络，用于投机解码。</dd>
+
+  <dt><strong>EOS</strong> (End-Of-Sequence)</dt>
+  <dd>序列结束 token，遇到则该 seq 完成。</dd>
+
+  <dt><strong>EP</strong> (Expert Parallelism)</dt>
+  <dd>把 MoE 的不同 expert 放到不同设备。</dd>
+
+  <dt><strong>FP8</strong></dt>
+  <dd>8-bit 浮点格式，常见 E4M3（更高精度）与 E5M2（更大范围）。Hopper / MI300 原生支持。</dd>
+</dl>
+
+<h2>G — N</h2>
+<dl>
+  <dt><strong>GPTQ</strong></dt>
+  <dd>基于 Hessian 信息逐层量化的方法，常见 4-bit per-group。</dd>
+
+  <dt><strong>Goodput</strong></dt>
+  <dd>满足延迟 SLA 的吞吐量。</dd>
+
+  <dt><strong>HBM</strong></dt>
+  <dd>High Bandwidth Memory，GPU 显存。</dd>
+
+  <dt><strong>Hybrid KV Cache</strong></dt>
+  <dd>V1 中支持不同层用不同形状的 KV 缓存（如 Mamba+Attention 混合架构）。</dd>
+
+  <dt><strong>ITL</strong> (Inter-Token Latency)</dt>
+  <dd>相邻两个输出 token 之间的间隔。</dd>
+
+  <dt><strong>KV Cache</strong></dt>
+  <dd>缓存历史 token 的 Key/Value 张量以避免重算。</dd>
+
+  <dt><strong>LoRA</strong></dt>
+  <dd>低秩适配，把对 W 的更新写成 BA 的乘积形式。</dd>
+
+  <dt><strong>Marlin / Machete</strong></dt>
+  <dd>vLLM 中两种高性能量化 GEMM kernel 实现。</dd>
+
+  <dt><strong>Medusa</strong></dt>
+  <dd>在主模型上加多个输出头进行投机预测的方法。</dd>
+
+  <dt><strong>MoE</strong> (Mixture-of-Experts)</dt>
+  <dd>每个 token 只激活若干 expert，参数总量大但单 token 算力小。</dd>
+
+  <dt><strong>NCCL</strong></dt>
+  <dd>NVIDIA 的 GPU 集合通信库。</dd>
+</dl>
+
+<h2>P — Z</h2>
+<dl>
+  <dt><strong>PagedAttention</strong></dt>
+  <dd>vLLM 核心创新：用块表把 KV 缓存按块管理。</dd>
+
+  <dt><strong>PP</strong> (Pipeline Parallelism)</dt>
+  <dd>把不同层放到不同设备形成流水线。</dd>
+
+  <dt><strong>Preemption</strong></dt>
+  <dd>资源不足时让某些 seq 暂时退出，后续以 Recompute 或 Swap 恢复。</dd>
+
+  <dt><strong>Prefill</strong></dt>
+  <dd>对 prompt 一次性计算 K/V。</dd>
+
+  <dt><strong>Prefix Caching</strong></dt>
+  <dd>自动复用相同前缀的 KV 块，命中后 prefill 时间近乎为 0。</dd>
+
+  <dt><strong>Recompute</strong></dt>
+  <dd>抢占恢复时丢弃 KV 重新 prefill。</dd>
+
+  <dt><strong>SP</strong> (Sequence Parallelism)</dt>
+  <dd>把同一条 sequence 的 token 维度切分到多设备，支撑超长上下文。</dd>
+
+  <dt><strong>Speculative Decoding</strong></dt>
+  <dd>用 draft 模型一次预测多个 token，target 模型一次验证。</dd>
+
+  <dt><strong>SSE</strong> (Server-Sent Events)</dt>
+  <dd>HTTP 流式协议，OpenAI API 的流式响应使用它。</dd>
+
+  <dt><strong>Swap</strong></dt>
+  <dd>抢占恢复时把 KV 从 GPU 拷到 CPU 内存暂存。</dd>
+
+  <dt><strong>TP</strong> (Tensor Parallelism)</dt>
+  <dd>把每层权重矩阵按维度切到多设备。</dd>
+
+  <dt><strong>TPOT</strong> (Time Per Output Token)</dt>
+  <dd>每个输出 token 的平均时间。</dd>
+
+  <dt><strong>TTFT</strong> (Time To First Token)</dt>
+  <dd>请求到达到首 token 输出之间的时间。</dd>
+
+  <dt><strong>V0 / V1</strong></dt>
+  <dd>vLLM 的两代引擎实现，新功能优先落地于 V1。</dd>
+
+  <dt><strong>XGrammar</strong></dt>
+  <dd>基于上下文无关文法 / EBNF 的高性能结构化输出 mask 引擎。</dd>
+</dl>
+
+<p>找不到某个术语？欢迎到本 Wiki 仓库提 PR 补充。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

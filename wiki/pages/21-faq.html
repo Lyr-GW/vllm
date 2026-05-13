@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>常见问答 FAQ — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 常见问答 FAQ">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="faq">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>常见问答 FAQ</h1>
+<p class="page-meta"><span>📚 参考 · 21/22</span></p>
+
+<h2>启动 / 安装</h2>
+
+<h3>Q: 装好了运行报 <code>ImportError: ... CUDA</code>？</h3>
+<p>多半是 PyTorch 与 CUDA driver 版本不匹配。用 <code>python -m vllm collect_env</code>
+看 PyTorch 编译时的 CUDA 与 <code>nvidia-smi</code> 里的 driver 版本对照——后者需要 ≥ 前者要求的最低版本。</p>
+
+<h3>Q: 用 <code>docker run</code> 启动一会儿 SIGBUS？</h3>
+<p>共享内存不足。加 <code>--ipc=host</code> 或 <code>--shm-size=8g</code>。</p>
+
+<h2>显存 / OOM</h2>
+
+<h3>Q: 显存够，但启动就 OOM？</h3>
+<p>vLLM 会"占用 GPU 显存的 90%"用作 KV pool，机器上别的进程会被挤掉。
+把 <code>--gpu-memory-utilization</code> 调到 0.8 或更低。</p>
+
+<h3>Q: 上下文长度想拉到 128K，但显存不够？</h3>
+<ol>
+  <li>把 <code>--kv-cache-dtype</code> 改 <code>fp8_e4m3</code>，KV 显存减半；</li>
+  <li>加量化（AWQ/GPTQ/FP8）减少权重显存；</li>
+  <li>加 TP 把模型切到多卡；</li>
+  <li>仍不够则减 <code>--max-model-len</code> 或上 Sequence Parallel。</li>
+</ol>
+
+<h3>Q: 我看到大量 <code>num_preemptions_total</code>？</h3>
+<p>并发太高，KV 不够时就会抢占。降 <code>--max-num-seqs</code>，或加显存 / 量化。</p>
+
+<h2>性能</h2>
+
+<h3>Q: 多卡 TP 没有线性加速？</h3>
+<p>正常。每层有 all-reduce 通信成本，TP=2 通常 1.7~1.9×，TP=4 大约 3.0~3.5×。
+跨 PCIe 比 NVLink 慢得多。也确认 <code>NCCL_DEBUG=INFO</code> 看是否走 P2P。</p>
+
+<h3>Q: TTFT 很高？</h3>
+<ul>
+  <li>Prompt 巨长 → 开 chunked prefill，注意 <code>--max-num-batched-tokens</code>；</li>
+  <li>每次 system prompt 都不一样 → Prefix Cache 命不中，看能否把模板部分稳定下来；</li>
+  <li>第一次启动慢 → CUDA Graph / torch.compile 首次捕获，后续会快。</li>
+</ul>
+
+<h3>Q: 怎么完全关闭 CUDA Graph 调试？</h3>
+<p><code>--enforce-eager</code>。</p>
+
+<h2>功能 / 集成</h2>
+
+<h3>Q: 怎么和 OpenWebUI / LangChain / LlamaIndex 接？</h3>
+<p>它们都支持 OpenAI 兼容 API：把 base URL 设成 <code>http://your-vllm:8000/v1</code>、
+API key 设成任意字符串（除非你启用 <code>--api-key</code>）即可。</p>
+
+<h3>Q: 怎样保证生成的是合法 JSON？</h3>
+<p>用 <a href="15-sampling.html">结构化输出</a> 的 <code>guided_json</code>，
+而不是寄希望于 prompt 工程。</p>
+
+<h3>Q: 同一服务能挂多份 LoRA 吗？</h3>
+<p>能，见 <a href="12-lora.html">LoRA 多适配器</a>。</p>
+
+<h3>Q: 想做 batch 离线推理几百万条，怎么写？</h3>
+<p>用 <code>LLM.generate(list_of_prompts)</code> 一口气塞进去；vLLM 内部会自动连续批处理。
+注意控制 <code>max_tokens</code>，并打开 Prefix Cache 来复用常见前缀。</p>
+
+<h2>调试</h2>
+
+<h3>Q: 跑着跑着输出乱码？</h3>
+<p>大概率 dtype / 量化与硬件不匹配（如 A100 跑 FP8）。先用 fp16/bf16 验证模型基线，再上量化。</p>
+
+<h3>Q: NCCL 卡住怎么办？</h3>
+<p>开 <code>NCCL_DEBUG=INFO</code>、<code>NCCL_DEBUG_SUBSYS=ALL</code>，看是否在 init 阶段挂死；
+云环境上 P2P 不可用时设 <code>NCCL_P2P_DISABLE=1</code>。</p>
+
+<h3>Q: 想抓 profile？</h3>
+<p><code>VLLM_TORCH_PROFILER_DIR=/tmp/prof vllm serve ...</code>，
+然后用 TensorBoard / Chrome trace 看。</p>
+
+<h2>项目 / 社区</h2>
+
+<h3>Q: V0 还是 V1？</h3>
+<p>新项目直接 V1（V1 是默认）；老脚本可能仍依赖 V0，必要时 <code>VLLM_USE_V1=0</code> 切回。</p>
+
+<h3>Q: 在哪问问题？</h3>
+<ul>
+  <li>使用问题：<a href="https://discuss.vllm.ai" target="_blank" rel="noopener">discuss.vllm.ai</a></li>
+  <li>Bug / 功能：GitHub Issues</li>
+  <li>开发协作：<a href="https://slack.vllm.ai" target="_blank" rel="noopener">slack.vllm.ai</a></li>
+  <li>安全披露：GitHub Security Advisory</li>
+</ul>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>调度器与执行循环 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 调度器与执行循环">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="scheduler">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>调度器与执行循环</h1>
+<p class="page-meta"><span>🧠 核心原理 · 8/22</span></p>
+
+<h2>它在哪</h2>
+<ul>
+  <li>V0：<code>vllm/core/scheduler.py</code></li>
+  <li>V1：<code>vllm/v1/core/sched/scheduler.py</code></li>
+</ul>
+<p>调度器是引擎每一步开始时调用的"裁判"：选择本步要执行的 sequence、给它们分配 KV block。
+它有一个最重要的方法 <code>schedule()</code>，返回一组 <code>SchedulerOutput</code>，
+让 worker 据此构造批次。</p>
+
+<h2>三态队列</h2>
+<ul>
+  <li><code>WAITING</code>：到达但还没分到 KV 块的请求（多半因为显存暂时不够）。</li>
+  <li><code>RUNNING</code>：正在被引擎处理的请求。</li>
+  <li><code>SWAPPED</code>（V0）：被抢占后 KV 块换到 CPU 的请求。V1 中合并到统一的"被抢占待恢复"语义。</li>
+</ul>
+
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> WAITING
+  WAITING --> RUNNING: 显存够 / 块够
+  RUNNING --> RUNNING: 每步推进一个 token
+  RUNNING --> PREEMPTED: 块紧张 / 高优请求抢占
+  PREEMPTED --> RUNNING: 恢复
+  RUNNING --> FINISHED: EOS / stop / max_tokens
+  FINISHED --> [*]
+</div>
+
+<h2>每一步在做什么</h2>
+<ol>
+  <li>统计当前已用 / 空闲 KV 块。</li>
+  <li>遍历 RUNNING 序列：每条预估本步需要 1 个 token 槽（decode）或 N 个 token 槽（chunked prefill）。</li>
+  <li>如果总需求超过空闲，进入<strong>抢占</strong>路径：按优先级 / FIFO 选若干 RUNNING 退出。</li>
+  <li>把 WAITING 队列里能塞进剩余预算的请求拉上来 prefill。</li>
+  <li>构造本步的 <code>SchedulerOutput</code>：每个 seq 的 token_ids、新分到的 block ids、是否是 prefill。</li>
+</ol>
+
+<h2>抢占：Recompute vs Swap</h2>
+<p>当资源不够，调度器必须"让某些 seq 暂时下车"。它有两种处理方式：</p>
+<table>
+  <thead><tr><th>策略</th><th>含义</th><th>代价</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Recompute</strong></td><td>丢弃该 seq 的 KV Cache，下次恢复时整段 prompt 重做 prefill。</td><td>重算时间</td></tr>
+    <tr><td><strong>Swap</strong></td><td>把 KV 块从 GPU 拷到 CPU 内存（<code>--swap-space</code>），恢复时拷回来。</td><td>PCIe 带宽</td></tr>
+  </tbody>
+</table>
+<p>当 prompt 短、上下文短，Recompute 更划算；prompt 长则 Swap 更划算。V1 中 Swap 不是默认行为，
+具体策略由 <code>preemption_mode</code> 控制。</p>
+
+<h2>优先级与公平性</h2>
+<p>vLLM 默认按 FCFS（先到先得）。但你可以：</p>
+<ul>
+  <li>在 API 层为请求带 <code>priority</code>（高优会被优先调度，必要时抢占低优）；</li>
+  <li>使用<strong>请求级别的最大上下文 / 最大生成长度</strong>限制，
+    防止单个长请求长期占用大量 KV 块；</li>
+  <li>结合 Data Parallelism（多 engine 副本）把流量分到多个实例。</li>
+</ul>
+
+<h2>与 KV Manager 的协作</h2>
+<p>调度器只回答"本步要跑谁"，<strong>不直接管 K/V 怎么放</strong>。它向 KV Manager 询问"为这条 seq 多要一个块"，
+manager 返回新块号或 <code>None</code>（满了）。这样的解耦使两者都可以独立替换：</p>
+<ul>
+  <li>Manager 在 V1 中重写为 <code>kv_cache_manager.py</code>，支持 hybrid layout；</li>
+  <li>Scheduler 在 V1 中重写为单一的 <code>Scheduler</code> 类（不再区分 prefill / decode 两个 scheduler）。</li>
+</ul>
+
+<h2>读源码的入口</h2>
+<pre><code class="language-text">vllm/v1/core/sched/scheduler.py
+  └─ class Scheduler
+       └─ def schedule() -> SchedulerOutput
+vllm/v1/core/kv_cache_manager.py
+  └─ class KVCacheManager
+       └─ allocate / free / can_allocate
+vllm/v1/engine/core.py
+  └─ class EngineCore
+       └─ def step(): self.scheduler.schedule(); self.execute_model(...)</code></pre>
+
+<h2>实操影响</h2>
+<ul>
+  <li>你看到 <code>vllm:num_preemptions_total</code> 飙高？说明并发 / 上下文太大，调小 <code>--max-num-seqs</code> 或 <code>--max-model-len</code>。</li>
+  <li>稳定开 Prefix Cache 能让被 Recompute 的请求恢复时秒到——因为它的前缀块大概率还在缓存里。</li>
+  <li>用 <code>--scheduling-policy priority</code> 时，给在线流量打高优、批量任务打低优，体感会平稳很多。</li>
+</ul>
+
+<p>到这里你已经看完 vLLM 的"性能三件套"。下面进入<strong>关键特性</strong>专题，
+从 <a href="09-quantization.html">量化</a> 开始。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

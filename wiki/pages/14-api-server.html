@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenAI 兼容 API — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — OpenAI 兼容 API">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="api-server">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>OpenAI 兼容 API</h1>
+<p class="page-meta"><span>🛠️ 使用面 · 14/22</span></p>
+
+<h2>设计目标</h2>
+<p><code>vllm serve</code> 启动的服务<strong>尽量贴近 OpenAI 官方 REST 规范</strong>，
+使得几乎所有针对 OpenAI 写的 SDK / 工具（LangChain、LlamaIndex、OpenWebUI、AutoGen、CrewAI…）
+都能直接接入。</p>
+
+<h2>主要 endpoint</h2>
+<table>
+  <thead><tr><th>路径</th><th>方法</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>聊天补全（含流式、工具调用、推理 reasoning）</td></tr>
+    <tr><td><code>/v1/completions</code></td><td>POST</td><td>传统 completion（无 chat template）</td></tr>
+    <tr><td><code>/v1/embeddings</code></td><td>POST</td><td>嵌入（模型需是 embedding 模型）</td></tr>
+    <tr><td><code>/v1/score</code></td><td>POST</td><td>打分 / rerank</td></tr>
+    <tr><td><code>/v1/audio/transcriptions</code></td><td>POST</td><td>Whisper 等音频转写</td></tr>
+    <tr><td><code>/v1/models</code></td><td>GET</td><td>列模型 + LoRA 适配器</td></tr>
+    <tr><td><code>/metrics</code></td><td>GET</td><td>Prometheus 指标</td></tr>
+    <tr><td><code>/health</code></td><td>GET</td><td>健康检查</td></tr>
+    <tr><td><code>/tokenize</code> / <code>/detokenize</code></td><td>POST</td><td>调试与计费用的 tokenization</td></tr>
+  </tbody>
+</table>
+
+<h2>流式（SSE）</h2>
+<p>把请求体里的 <code>"stream": true</code> 打开，server 会逐 chunk 推送 <code>data: {...}</code> 行，
+最后以 <code>data: [DONE]</code> 结束。客户端按行读取即可。</p>
+
+<pre><code class="language-python">resp = client.chat.completions.create(
+    model="...",
+    messages=[{"role": "user", "content": "讲个笑话"}],
+    stream=True,
+)
+for chunk in resp:
+    d = chunk.choices[0].delta.content
+    if d: print(d, end="", flush=True)
+</code></pre>
+
+<h2>工具调用 / Function Calling</h2>
+<p>支持工具调用的模型（Llama-3.1+ tools、Qwen-2.5 tools、Hermes、Mistral…）可以这样用：</p>
+<pre><code class="language-json">{
+  "model": "...",
+  "messages": [...],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "查天气",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type":"string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "tool_choice": "auto"
+}</code></pre>
+
+<p>启动时需要选 parser：</p>
+<pre><code class="language-bash">vllm serve &lt;model&gt; \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes        # 也可以是 llama3_json / mistral / pythonic / ...</code></pre>
+
+<h2>Reasoning 输出（DeepSeek-R1 风格）</h2>
+<p>对 <em>"先思考，再回答"</em> 的模型，可启用 reasoning parser，
+让"思考"内容单独放在 <code>reasoning_content</code> 字段：</p>
+<pre><code class="language-bash">vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --enable-reasoning \
+  --reasoning-parser deepseek_r1</code></pre>
+
+<h2>结构化输出</h2>
+<p>详见 <a href="15-sampling.html">采样与结构化输出</a>。可以传 <code>response_format</code> /
+<code>guided_json</code> / <code>guided_regex</code> / <code>guided_grammar</code> /
+<code>guided_choice</code>。</p>
+
+<h2>鉴权</h2>
+<p>用 <code>--api-key</code> 启动，客户端就要带 <code>Authorization: Bearer ...</code>。
+也支持文件里多 key（<code>--api-key /path/to/keys.txt</code>，按行）。</p>
+
+<h2>Prometheus 指标</h2>
+<p><code>/metrics</code> 输出包括：</p>
+<ul>
+  <li><code>vllm:num_requests_running</code> / <code>vllm:num_requests_waiting</code></li>
+  <li><code>vllm:time_to_first_token_seconds</code>（TTFT）</li>
+  <li><code>vllm:time_per_output_token_seconds</code>（TPOT）</li>
+  <li><code>vllm:gpu_cache_usage_perc</code></li>
+  <li><code>vllm:prefix_cache_hit_rate</code></li>
+  <li><code>vllm:num_preemptions_total</code></li>
+</ul>
+
+<h2>路由 / 多副本</h2>
+<p>vLLM 自身不内置 LB。常见做法：</p>
+<ul>
+  <li>用 <code>--data-parallel-size N</code> 起内部多副本；</li>
+  <li>外部用 Nginx / Envoy / Kubernetes Service 做轮询；</li>
+  <li>用 <code>vLLM Production Stack</code> 等社区项目做 KV 复用 / 路由感知。</li>
+</ul>
+
+<h2>源码位置</h2>
+<ul>
+  <li><code>vllm/entrypoints/openai/api_server.py</code>：FastAPI app。</li>
+  <li><code>vllm/entrypoints/openai/serving_*.py</code>：各 endpoint 的业务逻辑。</li>
+  <li><code>vllm/entrypoints/openai/tool_parsers/</code>：各家工具调用 parser。</li>
+  <li><code>vllm/reasoning/</code>：reasoning parser。</li>
+</ul>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

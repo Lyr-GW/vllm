@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LoRA 多适配器 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — LoRA 多适配器">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="lora">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>LoRA 多适配器</h1>
+<p class="page-meta"><span>🚀 关键特性 · 12/22</span></p>
+
+<h2>LoRA 是什么</h2>
+<p>LoRA（Low-Rank Adaptation）只训练两个小矩阵 <code>A ∈ R^{d×r}</code>、<code>B ∈ R^{r×d}</code>
+（<em>r</em> 通常 8/16/32），推理时把它们叠加到基座权重上：</p>
+
+<p style="text-align:center;"><code>W' = W + (α/r) · B · A</code></p>
+
+<p>因此一份基座可以挂多种 LoRA 适配器（领域、风格、人格、租户隔离），
+共享显存里那份巨大的基座权重，仅按 <em>r</em> 增加少量参数。</p>
+
+<h2>vLLM 的多 LoRA 调度</h2>
+<p>vLLM 支持<strong>同一 batch 内多个请求各自挂不同的 LoRA</strong>。它通过专门的
+<a href="https://arxiv.org/abs/2310.18547" target="_blank" rel="noopener">Punica</a> 风格内核，
+按 token 标签把矩阵乘"分配"到对应适配器，避免逐请求顺序处理。</p>
+
+<h2>启动与调用</h2>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --enable-lora \
+  --max-loras 4 \
+  --max-lora-rank 32 \
+  --lora-modules \
+    sql=path/to/sql-lora \
+    cn-styled=path/to/zh-style-lora</code></pre>
+
+<p>调用时通过 <code>model</code> 字段指定使用哪个适配器：</p>
+<pre><code class="language-python">from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+client.chat.completions.create(
+    model="sql",     # 名字来自 --lora-modules
+    messages=[{"role": "user", "content": "把这段需求转成 SQL: ..."}],
+)
+</code></pre>
+
+<p>也可以<strong>动态</strong>加载/卸载（避免重启服务）：</p>
+<pre><code class="language-bash">curl -X POST http://localhost:8000/v1/load_lora_adapter \
+  -d '{"lora_name": "new", "lora_path": "/data/new-lora"}'
+
+curl -X POST http://localhost:8000/v1/unload_lora_adapter \
+  -d '{"lora_name": "new"}'</code></pre>
+
+<p>开启动态加载需要 <code>--enable-lora-bias</code>（如适用）与 <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING=True</code>（按版本而异）。</p>
+
+<h2>关键参数</h2>
+<table>
+  <thead><tr><th>参数</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>--max-loras</code></td><td>引擎可<strong>同时驻留</strong>的 LoRA 数（GPU 上的"slot"）</td></tr>
+    <tr><td><code>--max-lora-rank</code></td><td>所有 LoRA 的 r 上限（统一以最大值分配 buffer）</td></tr>
+    <tr><td><code>--max-cpu-loras</code></td><td>允许 CPU 内存里缓存的 LoRA 总数（命中后再换上 GPU）</td></tr>
+    <tr><td><code>--fully-sharded-loras</code></td><td>结合 TP 时将 LoRA 也切分</td></tr>
+    <tr><td><code>--lora-dtype</code></td><td><code>auto</code> / <code>float16</code> / <code>bfloat16</code> / <code>float32</code></td></tr>
+  </tbody>
+</table>
+
+<h2>与量化、TP、长上下文的关系</h2>
+<ul>
+  <li><strong>量化基座 + fp16 LoRA</strong>：可行，社区常用 QLoRA 训练即是这种思路。</li>
+  <li><strong>TP</strong>：LoRA 矩阵也按 TP 切分，性能基本不下降。</li>
+  <li><strong>长上下文 + LoRA</strong>：与基座一致，PagedAttention 不受影响。</li>
+</ul>
+
+<h2>什么时候不要用</h2>
+<ul>
+  <li>需要改动 embedding 词表 / token 化的场景，应优先全参数微调。</li>
+  <li>"行为差异巨大"的多任务（比如代码 vs 多语对话）建议各起一个引擎，而非靠一份基座 + 多个 LoRA。</li>
+</ul>
+
+<h2>源码位置</h2>
+<ul>
+  <li><code>vllm/lora/</code>：LoRA 模型 / 请求注解 / 加载逻辑。</li>
+  <li><code>csrc/</code> 中的 Punica 风格 kernel（不同后端命名不一致）。</li>
+</ul>
+
+<p>下一页：<a href="13-multimodal.html">多模态</a>。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

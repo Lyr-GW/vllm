@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>项目简介 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 项目简介">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="introduction">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>项目简介</h1>
+<p class="page-meta"><span>📖 入门 · 1/22</span><span>· 阅读约 6 分钟</span></p>
+
+<p><strong>vLLM</strong>（读作 <em>vee-LLM</em>）是一个面向大语言模型（LLM）的高性能
+<strong>推理与服务库</strong>。它最初由加州大学伯克利分校 Sky Computing Lab 在 2023 年开源，
+2024 年成为 <a href="https://pytorch.org/blog/vllm-joins-pytorch" target="_blank" rel="noopener">PyTorch 基金会</a>
+托管项目。一句话定位：</p>
+
+<blockquote>Easy, fast, and cheap LLM serving for everyone.</blockquote>
+
+<h2>它解决了什么问题</h2>
+<p>传统 LLM 推理系统在两件事上不够好：</p>
+<ul>
+  <li><strong>KV Cache 内存碎片严重</strong>：每个请求的上下文长度不同、生成长度不同，
+    用连续内存预分配会浪费大量显存（论文实测有效利用率不到 30%）。</li>
+  <li><strong>批处理粒度太粗</strong>：传统"等齐再批"会让短请求被长请求拖累，
+    GPU 时常处于"等输入"的空转。</li>
+</ul>
+<p>vLLM 给出的两个核心答案是：</p>
+<ol>
+  <li><a href="05-paged-attention.html"><strong>PagedAttention</strong></a>——
+    像操作系统给进程分配虚拟内存那样，按"块（block）"管理 KV 缓存，
+    显存利用率从 30% 量级提升到 96%+；</li>
+  <li><a href="07-continuous-batching.html"><strong>Continuous Batching</strong></a>——
+    以"iteration"为粒度调度新请求随时插入、完成请求随时退出，
+    GPU 利用率显著提高。</li>
+</ol>
+
+<h2>核心能力一览</h2>
+<div class="feature-grid">
+  <div class="feature"><strong>极致吞吐</strong>同模型下相对原生 HF/Transformers 实现可提升数倍。</div>
+  <div class="feature"><strong>显存友好</strong>PagedAttention + Prefix Caching 让长上下文几乎不浪费。</div>
+  <div class="feature"><strong>易用接口</strong><code>LLM(...).generate()</code> 一行离线推理；<code>vllm serve</code> 一条命令起 OpenAI 兼容 HTTP 服务。</div>
+  <div class="feature"><strong>多硬件</strong>NVIDIA / AMD / Intel CPU&amp;GPU / TPU / Gaudi / Spyre / Ascend …</div>
+  <div class="feature"><strong>多并行</strong>Tensor / Pipeline / Data / Expert / Sequence 并行齐全。</div>
+  <div class="feature"><strong>多模型</strong>无缝兼容主流 HuggingFace 权重，含 MoE、Embedding、多模态。</div>
+  <div class="feature"><strong>多算法</strong>Beam search、并行采样、投机解码、Guided/JSON 结构化输出、Tool calling。</div>
+  <div class="feature"><strong>多量化</strong>GPTQ / AWQ / AutoRound / FP8 / INT8 / INT4 / BitsAndBytes。</div>
+</div>
+
+<h2>关键里程碑</h2>
+<table>
+  <thead><tr><th>时间</th><th>事件</th></tr></thead>
+  <tbody>
+    <tr><td>2023-06</td><td>vLLM 首次开源，FastChat-vLLM 集成驱动 Chatbot Arena</td></tr>
+    <tr><td>2023-09</td><td>论文 <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em> 发表于 SOSP'23</td></tr>
+    <tr><td>2024-07</td><td>支持 Llama 3.1 + FP8 + 流水线并行</td></tr>
+    <tr><td>2024-12</td><td>加入 PyTorch Ecosystem</td></tr>
+    <tr><td>2025-01</td><td><a href="https://blog.vllm.ai/2025/01/27/v1-alpha-release.html" target="_blank" rel="noopener">V1 架构</a> alpha 发布：1.7× 端到端加速、零开销 prefix caching</td></tr>
+    <tr><td>2025-05</td><td>加入 PyTorch 基金会</td></tr>
+  </tbody>
+</table>
+
+<h2>适合 / 不适合什么</h2>
+<p><strong>非常适合</strong>：</p>
+<ul>
+  <li>需要高吞吐对外提供 OpenAI 兼容服务（聊天、补全、嵌入、打分）；</li>
+  <li>需要离线大批量推理（生成训练数据、合成评测）；</li>
+  <li>多用户共享一个或多个 GPU 的场景；</li>
+  <li>需要长上下文（32K~1M）且对显存敏感。</li>
+</ul>
+<p><strong>不那么适合</strong>：</p>
+<ul>
+  <li>单条请求、极低 batch、对单次延迟做极致工程的场景（可考虑 TensorRT-LLM / SGLang 等横向对比）；</li>
+  <li>训练（vLLM 不是训练框架；它只关心推理与服务）；</li>
+  <li>需要在异构边缘设备上跑（vLLM 主要面向数据中心 GPU 和高端 CPU）。</li>
+</ul>
+
+<h2>与本 Wiki 的关系</h2>
+<p>官方文档（<a href="https://docs.vllm.ai" target="_blank" rel="noopener">docs.vllm.ai</a>）覆盖面广而精，但对中文读者来说阅读成本不低，
+本 Wiki 的目标是<strong>把概念"翻译"过来并加上来自源码层的解释</strong>，让你看完后能：</p>
+<ul>
+  <li>读懂 vLLM 的设计动机与权衡；</li>
+  <li>知道每个特性应该用哪个命令行参数 / Python 字段开启；</li>
+  <li>快速定位到 <code>vllm/</code> 或 <code>csrc/</code> 里对应的源码位置（详见
+    <a href="19-source-tree.html">源码目录速查</a>）。</li>
+</ul>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CUDA Graph & torch.compile — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — CUDA Graph & torch.compile">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="cuda-graph-compile">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>CUDA Graph &amp; torch.compile</h1>
+<p class="page-meta"><span>⚡ 性能 · 16/22</span></p>
+
+<h2>问题：Kernel Launch 开销</h2>
+<p>Decode 阶段每生成一个 token 都会触发几十到上百个 CUDA kernel launch。
+每次 launch 在 CPU↔GPU 之间有几微秒的延迟；在小 batch / 短 seq 下，
+这部分开销可能占总时间的 30%+。</p>
+
+<h2>CUDA Graph 是什么</h2>
+<p>CUDA Graph 把一段"已经知道形状"的计算流"录像"成一个 graph 对象。
+之后可以用一次 <code>cudaGraphLaunch</code> 把整段重放，跳过逐 kernel 的 host 提交开销。</p>
+
+<div class="mermaid">
+flowchart LR
+  A[首次执行: capture] --> B[CUDAGraph 对象]
+  B --> C[后续相同形状: replay]
+  C --> D[GPU 上批量执行所有 kernels]
+</div>
+
+<h2>vLLM 怎么用</h2>
+<ol>
+  <li>启动时，针对一组预先选定的 batch 大小（如 1, 2, 4, 8, ..., 256）<strong>预捕获</strong>
+    decode 阶段的 graph。</li>
+  <li>运行时，按实际 batch 找到最接近的"桶"，<strong>pad 到该桶大小</strong>后 replay。</li>
+  <li>Prefill 阶段形状变化太大（每条 prompt 不同长度），默认<strong>不</strong>用 graph。</li>
+</ol>
+
+<p>关键开关：</p>
+<table>
+  <thead><tr><th>开关</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>--enforce-eager</code></td><td>完全禁用 CUDA Graph，调试 / 老硬件时用</td></tr>
+    <tr><td><code>--cuda-graph-sizes</code></td><td>自定义要捕获的桶大小</td></tr>
+    <tr><td><code>--compilation-config</code></td><td>更细粒度的 compile + cudagraph 配置（V1）</td></tr>
+  </tbody>
+</table>
+
+<h2>torch.compile 集成</h2>
+<p>V1 中 vLLM 大量使用 <code>torch.compile</code> 把 Python 层 fuse 到 Inductor / Triton 内核，
+进一步减少 op overhead，并启用 fusion（如 RMSNorm + ResidualAdd + Quantize）。
+启动时会看到"Capturing compile graph"之类日志——这是<strong>首次启动的一次性</strong>开销，
+缓存命中后非常快。</p>
+
+<p>相关：</p>
+<ul>
+  <li><code>vllm/compilation/</code>：vLLM 自己的编译框架封装。</li>
+  <li>优化等级（<code>VLLM_USE_TRITON_FLASH_ATTN</code>、<code>VLLM_COMPILE_LEVEL</code>）参考
+    <code>docs/design/optimization_levels.md</code>。</li>
+</ul>
+
+<h2>动态 shape 怎么办</h2>
+<p>因为 graph 录的是固定形状，vLLM 用以下策略适配动态：</p>
+<ul>
+  <li><strong>Bucketing</strong>：把"实际 batch size 13"映射到"捕获的桶 16"，多 pad 3 个空槽位。</li>
+  <li><strong>多桶 capture</strong>：默认捕获 ~30 个常见大小，覆盖 1..最大并发。</li>
+  <li><strong>fallback to eager</strong>：超出最大桶 / 启用某些不兼容特性时退回到 eager 模式。</li>
+</ul>
+
+<h2>什么时候关掉 graph</h2>
+<ul>
+  <li>调试一个 reproducible 的报错（graph 的错误堆栈不友好）；</li>
+  <li>使用一些尚未兼容的特性（如某些前沿采样器、自定义 logits processor 操作了 Python 状态）；</li>
+  <li>启动时间敏感（捕获要时间）：<code>--cuda-graph-sizes 1 8</code> 只捕几个桶。</li>
+</ul>
+
+<h2>实操影响</h2>
+<ul>
+  <li>开启 graph 后，<strong>低并发</strong> 下 TPOT 通常下降 20%~40%。</li>
+  <li>高并发下收益变小（kernel 大、launch 占比下降）。</li>
+  <li>关闭 graph 时建议同时 <code>--enforce-eager</code>，避免半启用状态。</li>
+</ul>
+
+<p>继续：<a href="17-hardware-support.html">硬件后端支持</a>。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

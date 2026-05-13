@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>多模态 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 多模态">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="multimodal">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>多模态</h1>
+<p class="page-meta"><span>🚀 关键特性 · 13/22</span></p>
+
+<h2>vLLM 支持的多模态</h2>
+<p>多模态在 vLLM 中是<strong>一等公民</strong>：图像、视频、音频统一抽象为 <code>MultiModalInputs</code>。
+代表性模型：</p>
+
+<table>
+  <thead><tr><th>家族</th><th>典型模型</th><th>模态</th></tr></thead>
+  <tbody>
+    <tr><td>LLaVA</td><td>llava-1.5, llava-onevision, llava-next</td><td>图像</td></tr>
+    <tr><td>Qwen-VL</td><td>Qwen2-VL, Qwen2.5-VL</td><td>图像 / 视频</td></tr>
+    <tr><td>InternVL</td><td>InternVL2 / 2.5 / 3</td><td>图像 / 视频</td></tr>
+    <tr><td>Llama-Vision</td><td>Llama-3.2-11B-Vision-Instruct</td><td>图像</td></tr>
+    <tr><td>Pixtral</td><td>Pixtral-12B</td><td>图像</td></tr>
+    <tr><td>Phi-3-Vision, MiniCPM-V</td><td>—</td><td>图像</td></tr>
+    <tr><td>Whisper</td><td>—</td><td>音频（转写）</td></tr>
+    <tr><td>Granite-Speech / Voxtral</td><td>—</td><td>音频</td></tr>
+  </tbody>
+</table>
+
+<p>完整列表见 <a href="https://docs.vllm.ai/en/latest/models/supported_models.html" target="_blank" rel="noopener">官方支持模型表</a>。</p>
+
+<h2>调用方式</h2>
+
+<h3>离线 Python</h3>
+<pre><code class="language-python">from vllm import LLM
+from PIL import Image
+
+llm = LLM(model="llava-hf/llava-1.5-7b-hf", max_model_len=4096)
+
+# 输入字典：prompt + multi_modal_data
+out = llm.generate({
+    "prompt": "USER: &lt;image&gt;\n描述这张图。\nASSISTANT:",
+    "multi_modal_data": {"image": Image.open("cat.jpg")},
+})
+print(out[0].outputs[0].text)
+</code></pre>
+
+<h3>OpenAI 兼容 API（图像 URL / base64）</h3>
+<pre><code class="language-bash">curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "图里有几只猫？"},
+        {"type": "image_url",
+         "image_url": {"url": "https://example.com/cats.jpg"}}
+      ]
+    }]
+  }'</code></pre>
+
+<h3>视频</h3>
+<p>对支持视频的模型（如 Qwen2-VL、InternVL），传 <code>video_url</code> 或本地 mp4；
+vLLM 内部按帧抽取并交由模型处理。</p>
+
+<h2>背后发生了什么</h2>
+<div class="mermaid">
+flowchart LR
+  In[输入: text + image/video/audio]
+  P[Multi-Modal Processor\n(vllm/multimodal/)]
+  Tok[Tokenizer\n(text 部分)]
+  Vis[Vision Encoder\n(CLIP/ViT/SigLIP)]
+  Aud[Audio Encoder\n(Whisper/...)]
+  Emb[融合 embedding 序列]
+  LM[语言模型主体]
+  In --> P
+  P --> Tok & Vis & Aud
+  Tok --> Emb
+  Vis --> Emb
+  Aud --> Emb
+  Emb --> LM
+</div>
+
+<p>关键模块：</p>
+<ul>
+  <li><code>vllm/multimodal/</code>：注册 image/video/audio processor、token 计数、缓存。</li>
+  <li><code>vllm/model_executor/models/</code> 下的多模态模型实现（如 <code>llava.py</code>、<code>qwen2_vl.py</code>）。</li>
+</ul>
+
+<h2>Disaggregated Encoder（前沿）</h2>
+<p>对计算极重的视觉编码器，vLLM 在探索把"图像编码"与"文本生成"<strong>解耦到不同进程/不同硬件</strong>，
+减少编码尖峰对解码 batch 的扰动。详见 <code>docs/features/disagg_encoder.md</code>。</p>
+
+<h2>注意事项</h2>
+<ul>
+  <li><strong>显存预算</strong>：图像 token 计数往往以"百"为单位，长上下文 + 多图会迅速吃满 KV。</li>
+  <li><strong>处理器版本</strong>：HuggingFace 的 <code>processor</code> 与 <code>tokenizer</code> 版本一定要和模型匹配。</li>
+  <li><strong>多模态 + chat template</strong>：vLLM 默认沿用模型自带 template，自定义时务必正确占位 <code>&lt;image&gt;</code> / <code>&lt;|image|&gt;</code>。</li>
+</ul>
+
+<p>下一页：<a href="14-api-server.html">OpenAI 兼容 API</a> 的更多细节。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>
