@@ -87,6 +87,8 @@ flowchart LR
 <p>简化的 prefix-share 数学不变：</p>
 <pre><code>Attention(Q, K, V) = softmax(Q · K^T / sqrt(d_k)) · V</code></pre>
 <p>只是 <code>K</code>、<code>V</code> 的物理读取按 block 拆开，再合并到同一个 softmax 归一化里。</p>
+<p class="page-meta">📝 此处的 Q、K 已经经过 <a href="23-rope.html">RoPE 旋转</a>——
+位置信息在 attention 之前就被注入到向量里，因此 PagedAttention 内核无需感知位置。</p>
 
 <h2>block_size 怎么选</h2>
 <p><code>block_size</code> 是个权衡：</p>

@@ -136,5 +136,11 @@
     "url": "pages/22-glossary.html",
     "summary": "PagedAttention、KV、TP/PP/EP、LoRA、FP8、Prefix Cache、Spec Decode 等术语。",
     "keywords": ["glossary", "术语", "ttft", "tpot", "itl", "kv cache", "pagedattention", "lora", "fp8", "mo e"]
+  },
+  {
+    "title": "RoPE 旋转位置编码",
+    "url": "pages/23-rope.html",
+    "summary": "RoPE 的数学直觉、频率族设计、NeoX/GPT-J 两种风格、与 KV Cache 的协作、YaRN / NTK / Llama-3 / Phi-3 长上下文扩展，以及 vLLM 实现走查。",
+    "keywords": ["rope", "rotary position embedding", "旋转位置编码", "位置编码", "kv cache", "yarn", "ntk", "ntk-aware", "dynamic ntk", "long rope", "mrope", "neox", "gpt-j", "frequency", "theta", "cos_sin_cache", "pos_encoding_kernels", "apply_rotary_emb", "rotate_half"]
   }
 ]

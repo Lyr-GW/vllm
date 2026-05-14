@@ -42,6 +42,20 @@
 它先用一个假 batch 把模型跑一遍，测出非 KV 之外的显存峰值，剩下的空间全部切成 block 用作 KV Pool。
 这就是 <code>--gpu-memory-utilization</code> 的语义来源。</p>
 
+<h2>Q / K 何时被 RoPE 旋转</h2>
+<p><strong>一句话：进入 KV Cache 的 K 是<em>已经旋转过</em>的</strong>。
+在 attention 块里调用顺序固定为
+<code>q, k = self.rotary_emb(positions, q, k); self.attn(q, k, v)</code>，
+随后 <code>self.attn</code> 把旋转后的 k、v 写入 KV Cache。这样：</p>
+<ul>
+  <li>解码每步只对"新 token 的 q、k"做一次 O(1) 旋转，历史 K <strong>无需重算 RoPE</strong>；</li>
+  <li>下游 attention kernel 完全不需要感知位置编码——所有"长上下文 RoPE 扩展"
+    都只改 cos_sin_cache 表的内容，attention 代码不动；</li>
+  <li>Q 永远是"本步新出现的 token"，<strong>不进 cache</strong>。</li>
+</ul>
+<p>RoPE 的完整原理、与本页 KV 设计的相互作用、长上下文 RoPE 变体（YaRN/NTK/LongRoPE）
+等详见 <a href="23-rope.html">RoPE 旋转位置编码</a>。</p>
+
 <h2>核心数据结构</h2>
 <ul>
   <li><code>BlockTable</code>：每条 sequence 一份，是个 int 数组，索引 = 逻辑块号，值 = 物理块号。</li>

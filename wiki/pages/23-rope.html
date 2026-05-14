@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RoPE 旋转位置编码 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — 详解 RoPE：数学、几何直觉、与 KV Cache 协作、长上下文扩展、vLLM 源码走查。">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="rope">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>RoPE 旋转位置编码</h1>
+<p class="page-meta"><span>🧠 核心原理 · 附加 / 深入</span><span>· 阅读约 18 分钟</span></p>
+
+<p>本页解答两个问题：</p>
+<ol>
+  <li><strong>位置信息如何"旋转进"语义向量？</strong>——讲清楚 RoPE 把 token 嵌入两两配对当作复数、按位置乘上一个旋转因子的全过程；</li>
+  <li><strong>RoPE 与 KV Cache 怎么配合？</strong>——澄清 K 是<strong>旋转后</strong>才写入缓存，这一选择带来的所有连锁结果（解码不再重算 RoPE、Prefix Cache 仍能命中、长上下文为何需要 YaRN/NTK 等扩展）。</li>
+</ol>
+<p>讲解一律配上 <strong>vLLM 仓库的源码引用</strong>，并在末尾做一次"自查迭代"列出本页与其他 Wiki 页之间的潜在矛盾点。</p>
+
+<h2>动机：为什么需要位置编码</h2>
+
+<p>原始 Transformer 的 self-attention 对 token 顺序<strong>是置换不变的</strong>——
+打乱 <code>[A, B, C]</code> 顺序，每个位置上的 Q·Kᵀ 内积值都不变，模型完全"看不出"顺序。
+位置编码（Position Encoding, PE）的工作就是<strong>把序号注入到向量里</strong>，让 attention 区分先后。</p>
+
+<table>
+  <thead><tr><th>方案</th><th>形式</th><th>问题</th></tr></thead>
+  <tbody>
+    <tr><td><strong>绝对正弦 PE</strong>（原始 Transformer）</td><td>给嵌入加上 sin/cos 序列向量</td><td>外推差、相对位置不显式</td></tr>
+    <tr><td><strong>可学习 PE</strong>（BERT）</td><td>每个位置一个可学习向量</td><td>超出训练上下文就 OOD</td></tr>
+    <tr><td><strong>相对位置 PE</strong>（T5/Shaw）</td><td>attention 里加偏置项 b(i−j)</td><td>实现复杂，影响 kernel</td></tr>
+    <tr><td><strong>ALiBi</strong></td><td>attention logits 上加线性距离衰减</td><td>表达能力受限</td></tr>
+    <tr><td><strong>RoPE</strong>（Su et al. 2021）</td><td>把 Q/K 视为复数 <strong>按位置旋转</strong></td><td>—（事实标准）</td></tr>
+  </tbody>
+</table>
+
+<p>RoPE 之所以"赢"，三个原因：<strong>(1) 不增加参数，(2) 内积自然只依赖相对位置，
+(3) 改个公式即可外推到更长上下文</strong>。Llama 全家、Qwen、DeepSeek、Mistral、ChatGLM
+全用 RoPE。</p>
+
+<h2>核心思路：把维度两两配对当复数</h2>
+
+<p>记 token 在第 <em>i</em> 层、第 <em>h</em> 个 head 上的 query 向量是
+<em>q</em> ∈ ℝ<sup>d</sup>（<em>d</em> 为 head_dim，必须是偶数）。
+RoPE 的做法：</p>
+
+<ol>
+  <li>把 <em>q</em> 的 <em>d</em> 个分量两两配对，形成 <em>d/2</em> 对：
+    (q<sub>0</sub>, q<sub>1</sub>), (q<sub>2</sub>, q<sub>3</sub>), …, (q<sub>d−2</sub>, q<sub>d−1</sub>)。
+    每一对当作一个二维复平面里的向量
+    <em>z<sub>k</sub></em> = q<sub>2k</sub> + i·q<sub>2k+1</sub>。</li>
+  <li>对第 <em>k</em> 对，给它一个<strong>频率</strong> θ<sub>k</sub>。</li>
+  <li>当这个 token 处在位置 <em>m</em> 时，把第 <em>k</em> 对乘上 <em>e<sup>i·m·θ<sub>k</sub></sup></em>
+    ——即在复平面上<strong>旋转 m·θ<sub>k</sub> 弧度</strong>。</li>
+</ol>
+
+<p>用实数 2D 旋转矩阵写出来就是：</p>
+
+<div class="mermaid">
+flowchart LR
+  subgraph one[第 k 对维度]
+    A["(q_2k, q_2k+1)"]
+  end
+  R["乘上 2×2 旋转矩阵 R(m·θ_k)"]
+  A --> R --> B["(q'_2k, q'_2k+1)"]
+</div>
+
+<pre><code class="language-text">R(α) = | cos α   -sin α |
+       | sin α    cos α |
+
+(q'_2k    )   ( cos(m·θ_k)  -sin(m·θ_k) ) ( q_2k    )
+(q'_2k+1 ) = ( sin(m·θ_k)   cos(m·θ_k) ) ( q_2k+1 )</code></pre>
+
+<p>对 key 向量做<strong>完全一样</strong>的操作（同样的 θ 频率族）。这就是全部。</p>
+
+<div class="callout info">
+  <span class="callout-title">直观图像</span>
+  <p>想象 head_dim=64：你把这 64 维拆成 32 个二维平面。每个平面上有一个"指针"（向量）。
+  位置 <em>m</em> 把第 <em>k</em> 个平面的指针逆时针转 m·θ<sub>k</sub> 弧度。
+  转完之后再用旋转后的指针参与 attention。</p>
+</div>
+
+<h2>频率族 θ<sub>k</sub> 的设计</h2>
+
+<p>RoPE 的频率族延续了原始 sinusoidal PE 的"几何序列"思路。设旋转维度 <em>D</em> = head_dim
+（或 partial RoPE 下的 rotary_dim），基底（<code>base</code>，常用 10000）：</p>
+
+<pre><code class="language-text">θ_k = base^(-2k / D),   k = 0, 1, ..., D/2 - 1
+
+  → θ_0 = 1.0           (最高频, 一个 token 转 1 rad)
+  → θ_{D/2-1} ≈ 1/base  (最低频, 几乎不转)</code></pre>
+
+<p>对应到 vLLM 源码（<code>vllm/model_executor/layers/rotary_embedding/base.py</code>）：</p>
+
+<pre><code class="language-python">def _compute_inv_freq(self, base: float) -> torch.Tensor:
+    inv_freq = 1.0 / (
+        base ** (
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+        )
+    )
+    return inv_freq</code></pre>
+
+<p>这就是 θ<sub>k</sub> 列表。然后预先算好 <strong>每个绝对位置 m × 每个 θ<sub>k</sub></strong>
+的 cos、sin 查表，避免在线 sin/cos：</p>
+
+<pre><code class="language-python">def _compute_cos_sin_cache(self) -> torch.Tensor:
+    inv_freq = self._compute_inv_freq(self.base)
+    t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+
+    freqs = torch.einsum("i,j -> ij", t, inv_freq)   # [max_pos, D/2]
+    cos = freqs.cos()
+    sin = freqs.sin()
+    cache = torch.cat((cos, sin), dim=-1)             # [max_pos, D]
+    return cache</code></pre>
+
+<p>缓存形状 <code>[max_position, rotary_dim]</code>，前一半 cos、后一半 sin。
+后续<strong>所有 token 在所有层共享这一张表</strong>——RoPE 既不增加可训练参数，
+运行时也只多了一次 O(N·d) 的 elementwise 操作。</p>
+
+<h3>为什么是几何分布的频率？</h3>
+<ul>
+  <li><strong>低频维度负责"远距离"</strong>：θ 很小，几百上千个 token 累积下来才转完一圈，
+    适合表达"开头这段话是什么领域"这类长程关系。</li>
+  <li><strong>高频维度负责"近距离"</strong>：每隔一个 token 就转半圈，适合"刚刚那个词是不是动词"这类局部关系。</li>
+  <li>几何分布让模型在 <em>O(log L)</em> 个尺度上都能区分位置——和 multi-scale wavelet 同思路。</li>
+</ul>
+
+<h2>关键性质：内积只依赖相对位置</h2>
+
+<p>这是 RoPE 最重要的数学性质，也是它"用绝对旋转、得相对位置"的奥秘。</p>
+
+<p>设位置 <em>m</em> 处的 q' 是 R<sub>m</sub>·q，位置 <em>n</em> 处的 k' 是 R<sub>n</sub>·k
+（其中 R<sub>m</sub> 是把 m·θ 旋转打包成的块对角矩阵）。
+内积 (q')<sup>T</sup>(k')：</p>
+
+<pre><code class="language-text">(R_m q)^T (R_n k) = q^T R_m^T R_n k = q^T R_{n-m} k
+
+           (因为旋转矩阵 R_m^T = R_{-m}, R_{-m} R_n = R_{n-m})</code></pre>
+
+<p>也就是说：<strong>attention 分数 (q', k') 只通过 R<sub>n−m</sub> 依赖于"相对位置 n−m"</strong>，
+与 m、n 各自的绝对值无关——这正是相对位置编码梦寐以求的性质，
+RoPE 却用"对每个 token 单独绝对旋转"轻松拿到。</p>
+
+<div class="callout success">
+  <span class="callout-title">这条性质带来的工程好处</span>
+  <ol>
+    <li>Q、K 旋转完后可以直接走<strong>标准 dot-product attention 内核</strong>，
+      不需要为相对位置写特殊 kernel。FlashAttention/FlashInfer 直接受益。</li>
+    <li>位置信息<strong>不污染 V</strong>——V 完全不被 RoPE 触碰，attention 输出仍是原始的 value 加权。</li>
+    <li>对解码而言，每生成一个新 token，只要把"它的 q、k"按其位置 m 转一下；
+      <strong>历史 K 不必重算</strong>（因为它们的旋转已经在它们当时被写入 KV Cache 时完成）。</li>
+  </ol>
+</div>
+
+<h2>NeoX 风格 vs GPT-J 风格</h2>
+
+<p>"维度两两配对"有两种顺序，社区里两派并存：</p>
+
+<table>
+  <thead><tr><th>风格</th><th>配对方式</th><th>使用模型</th></tr></thead>
+  <tbody>
+    <tr><td><strong>GPT-NeoX style</strong><br>(<code>is_neox_style=True</code>)</td>
+        <td>把向量拆成"前半 / 后半"，第 k 维与第 k+D/2 维配对</td>
+        <td>LLaMA 全家、Qwen、Mistral、DeepSeek</td></tr>
+    <tr><td><strong>GPT-J style</strong><br>(<code>is_neox_style=False</code>)</td>
+        <td>相邻偶/奇下标配对（k 与 k+1）</td>
+        <td>GPT-J、ChatGLM 早期、GGUF llama 某些导出</td></tr>
+  </tbody>
+</table>
+
+<p>两种风格<strong>数学等价</strong>，但内存布局不同——错配会得到一个被"打乱"的 K，
+attention 输出像噪声。vLLM 用一个布尔参数同时支持，源码（<code>common.py</code>）：</p>
+
+<pre><code class="language-python">def apply_rotary_emb_torch(x, cos, sin, is_neox_style: bool) -> torch.Tensor:
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    if is_neox_style:
+        x1, x2 = torch.chunk(x, 2, dim=-1)           # 前半 / 后半
+    else:
+        x1 = x[..., ::2]                              # 偶数下标
+        x2 = x[..., 1::2]                             # 奇数下标
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    if is_neox_style:
+        return torch.cat((o1, o2), dim=-1)
+    else:
+        return torch.stack((o1, o2), dim=-1).flatten(-2)</code></pre>
+
+<p>注意公式 <code>o1 = x1·cos − x2·sin</code>、<code>o2 = x2·cos + x1·sin</code>——
+完全对应前面贴的 2D 旋转矩阵。</p>
+
+<h2>CUDA 内核走查</h2>
+
+<p>性能关键路径在 <code>csrc/pos_encoding_kernels.cu</code>。核心是一个
+"每个 thread block 处理一个 token、并行覆盖该 token 的所有 head × 旋转对"的内核：</p>
+
+<pre><code class="language-cpp">template &lt;typename scalar_t, bool IS_NEOX&gt;
+inline __device__ void apply_token_rotary_embedding(
+    scalar_t* __restrict__ arr,
+    const scalar_t* __restrict__ cos_ptr,
+    const scalar_t* __restrict__ sin_ptr,
+    int rot_offset, int embed_dim) {
+  int x_index, y_index;
+  scalar_t cos, sin;
+  if (IS_NEOX) {
+    // 前半 / 后半 配对
+    x_index = rot_offset;
+    y_index = embed_dim + rot_offset;
+    cos = VLLM_LDG(cos_ptr + x_index);
+    sin = VLLM_LDG(sin_ptr + x_index);
+  } else {
+    // 偶 / 奇 配对
+    x_index = 2 * rot_offset;
+    y_index = 2 * rot_offset + 1;
+    cos = VLLM_LDG(cos_ptr + x_index / 2);
+    sin = VLLM_LDG(sin_ptr + x_index / 2);
+  }
+  const scalar_t x = arr[x_index];
+  const scalar_t y = arr[y_index];
+  arr[x_index] = x * cos - y * sin;   // 同一个 2D 旋转
+  arr[y_index] = y * cos + x * sin;
+}</code></pre>
+
+<p>启动方式：<strong>每个 token 一个 block</strong>，block 内多线程并行处理
+<code>num_heads × embed_dim</code> 个标量对——一次 forward 整个 batch 的 Q、K 都在一个 launch 里转完。这是<strong>纯 elementwise，几乎完全 memory-bound</strong>，
+比起后续的 GEMM 与 attention 来说耗时可忽略。</p>
+
+<h2>在模型层是怎么被调用的</h2>
+
+<p>以 <code>vllm/model_executor/models/llama.py</code> 的 attention 块为例（节选）：</p>
+
+<pre><code class="language-python"># 一次 forward：
+qkv, _ = self.qkv_proj(hidden_states)
+q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+q, k = self.rotary_emb(positions, q, k)   # ← RoPE 在这里就地修改 q、k
+
+attn_output = self.attn(q, k, v)          # ← K、V 在 self.attn 内部
+                                          #   被写入 KV Cache 并参与 attention
+output, _ = self.o_proj(attn_output)</code></pre>
+
+<p>核心是 <code>self.rotary_emb(positions, q, k)</code>——它<strong>在 attention 之前</strong>
+把 Q、K 就地旋转好。<code>positions</code> 是一个一维 LongTensor，长度 = 本步要算的 token 数，
+每个元素是该 token 在<strong>所属 sequence 内的绝对位置</strong>。
+对连续批处理来说，这个张量里同一个 batch 不同请求的 token 各有各的 position，
+内核拿 <code>positions[token_idx]</code> 去查 cos_sin_cache。</p>
+
+<div class="callout info">
+  <span class="callout-title">这是 vLLM 与"按 batch padding 推理"框架的关键区别之一</span>
+  <p>传统实现是 <code>[batch, seq_len]</code> 矩形的 positions（每条 seq 0..L−1），
+  RoPE 内核因此要按 batch 维度 broadcast。vLLM V1 把所有 batch 拍平成
+  <code>[num_tokens]</code>，每个 token 自带它的位置——
+  这与 <a href="07-continuous-batching.html">连续批处理</a> 是一体化的设计。</p>
+</div>
+
+<h2>RoPE 与 KV Cache 的协作（核心连接）</h2>
+
+<p>这是本页第二个主问题。要把 RoPE 与 <a href="06-kv-cache.html">KV Cache</a> 之间的关系彻底说清楚，
+关键就一句话：</p>
+
+<blockquote><strong>K 是<em>旋转之后</em>才写入 KV Cache 的；Q 每次都重算，不缓存。</strong></blockquote>
+
+<p>对比一下推理时一个新 token 进入 attention 的流程：</p>
+
+<div class="mermaid">
+flowchart TB
+  H[hidden_state\n本步新 token] --> QKV[Wq, Wk, Wv 投影]
+  QKV --> Q[q_new]
+  QKV --> K[k_new]
+  QKV --> V[v_new]
+  Pos[positions[token_idx]] --> Rot[RoPE 旋转]
+  Q --> Rot
+  K --> Rot
+  Rot --> Qr[q' rotated]
+  Rot --> Kr[k' rotated]
+  Kr --> Cache[(KV Cache\n写入 k', v_new)]
+  V --> Cache
+  Cache --> Attn[Attention\nq' · K_cache^T / √d ·  V_cache]
+  Qr --> Attn
+  Attn --> Out
+</div>
+
+<h3>为什么"存旋转后的 K"是正确选择</h3>
+
+<table>
+  <thead><tr><th>方案</th><th>缓存什么</th><th>每步成本</th><th>分析</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM 实际（业界主流）</strong></td><td>旋转后的 K（已带位置）</td><td>仅对"新 token"做 RoPE</td><td>O(1) 旋转 + 直接 attention</td></tr>
+    <tr><td>朴素方案 A</td><td>旋转前的 K</td><td>每步都要把<strong>历史所有 K 重新旋转</strong></td><td>O(L) 额外开销 / 步，长上下文不可接受</td></tr>
+    <tr><td>朴素方案 B</td><td>缓存 hidden_state，每步重做 QKV+RoPE</td><td>每步重做 O(L) GEMM</td><td>退化为无缓存</td></tr>
+  </tbody>
+</table>
+
+<p>选 A 还有一个看似不严重、实际很麻烦的代价——长上下文扩展（YaRN / Dynamic NTK 等）让
+"位置 m 怎么旋转"<strong>依赖于本次推理所声明的 max_seq_len</strong>。
+缓存"未旋转 K"等于把这个决策延后到 attention 内部，所有 attention kernel 都要重写支持 RoPE 内联。
+而<strong>缓存"旋转后 K"则把 RoPE 隔离在 attention kernel 之外</strong>——这是个干净的解耦。</p>
+
+<h3>对 Prefix Caching 有什么影响</h3>
+
+<p>vLLM 的 <a href="06-kv-cache.html">Prefix Caching</a> 以"块（block）"为单位、对
+"截至此处的 token 序列"做哈希。RoPE 是<strong>纯函数</strong>——
+同一段 token 序列在同样的起始位置 0..N 下产生同样的旋转后 K，因此</p>
+
+<ul>
+  <li><strong>同一个 system prompt + 同样的工具描述</strong>：所有用户进来都命中前缀块；</li>
+  <li><strong>同一段对话的多轮</strong>：旧消息那部分 K 仍然命中（它们的位置没变）；</li>
+  <li><strong>把同一段文本插到不同位置</strong>：旋转结果不同 → 不复用 → 这是<em>正确</em>的行为，
+    不是 bug（因为位置不同时 attention 分数本就该不同）。</li>
+</ul>
+
+<div class="callout warn">
+  <span class="callout-title">什么时候 Prefix Cache 会"看着像命中却没命中"</span>
+  <p>(1) <strong>长上下文扩展配置变了</strong>（rope_scaling 的 type / factor / max_pos 改了）
+  → cos_sin_cache 重算 → 即使 token 序列一样，旋转结果也变了。这种情况建议清空 Prefix Cache。</p>
+  <p>(2) <strong>切了不同的 dtype</strong>（bf16 vs fp16）→ cos_sin_cache 精度位模式不同，
+  极端情况下 block hash 不一致。</p>
+</div>
+
+<h3>那 Q 呢？</h3>
+
+<p>Q 永远是"<strong>本步新出现的</strong> token 的"——历史 Q 与未来都无关，无需缓存。
+每步对新 Q 旋转一次（O(1) 开销）即可。</p>
+
+<h2>Partial RoPE 与 head_size 不等于 rotary_dim</h2>
+
+<p>有些模型并不把 head_dim 全部旋转，而是<strong>只对前 rotary_dim 维做 RoPE</strong>，
+后面那段保留原样（"NoPE"段）。源码里有专门处理：</p>
+
+<pre><code class="language-python">query = query.view(num_tokens, -1, head_size)
+query_rot  = query[..., :rotary_dim]      # 要旋转的部分
+query_pass = query[..., rotary_dim:]      # 直接透传
+query_rot  = apply_rotary_emb_torch(query_rot, cos, sin, is_neox_style)
+query = torch.cat((query_rot, query_pass), dim=-1)</code></pre>
+
+<p>典型例子：</p>
+<ul>
+  <li><strong>Phi-3 / Phi-3.5</strong>：partial_rotary_factor &lt; 1，前段旋转后段保留。</li>
+  <li><strong>DeepSeek-V2/V3（MLA）</strong>：把 K 拆成"压缩 latent"（无 RoPE）+ "解耦小段"（有 RoPE），
+    这是把 RoPE 与 KV 压缩两件事彻底解耦的巧思——见 <code>deepseek_scaling_rope.py</code>。</li>
+</ul>
+
+<h2>长上下文 RoPE 家族</h2>
+
+<p>RoPE 的频率族最初按"训练时见过的最大长度"设计。当推理时 token 位置超过这个范围，
+高频维度会迅速旋转到混乱区——模型外推 OOD。
+2023–2024 年涌现一组"长上下文 RoPE"方案，全部在 vLLM 中有实现：</p>
+
+<table>
+  <thead><tr>
+    <th>方案</th><th>vLLM 文件</th><th>核心 idea</th><th>使用模型</th>
+  </tr></thead>
+  <tbody>
+    <tr><td><strong>Linear PI</strong>（Position Interpolation）</td>
+        <td><code>linear_scaling_rope.py</code></td>
+        <td>把位置 m 缩放成 m/s（s = 扩展倍数），相当于"压扁 RoPE 频率"</td>
+        <td>早期 Llama-2 扩展</td></tr>
+    <tr><td><strong>NTK-aware</strong></td>
+        <td><code>ntk_scaling_rope.py</code></td>
+        <td>不缩位置，改基底 base→base·s<sup>D/(D−2)</sup>，让高频维度少变化</td>
+        <td>各种社区 fine-tune</td></tr>
+    <tr><td><strong>Dynamic NTK</strong></td>
+        <td><code>dynamic_ntk_scaling_rope.py</code> / <code>dynamic_ntk_alpha_rope.py</code></td>
+        <td>训练时不动，推理时按当前实际 seq_len 自适应放大基底</td>
+        <td>Qwen 部分版本</td></tr>
+    <tr><td><strong>YaRN</strong>（Yet another RoPE extensioN）</td>
+        <td><code>yarn_scaling_rope.py</code></td>
+        <td>对不同频率分段处理：低频按 PI 缩、高频按 NTK 放，再加全局温度修正</td>
+        <td>Yi、Qwen-2.5 长上下文</td></tr>
+    <tr><td><strong>Llama-3 RoPE</strong></td>
+        <td><code>llama3_rope.py</code></td>
+        <td>类似 YaRN 思路的频率分段，参数从 HF config 读</td>
+        <td>Llama-3.1+</td></tr>
+    <tr><td><strong>Phi-3 LongRoPE</strong></td>
+        <td><code>phi3_long_rope_scaled_rope.py</code></td>
+        <td>用搜索得到的<strong>逐维缩放因子表</strong>，short/long 两套配置切换</td>
+        <td>Phi-3-mini/medium long</td></tr>
+    <tr><td><strong>DeepSeek MLA RoPE</strong></td>
+        <td><code>deepseek_scaling_rope.py</code></td>
+        <td>仅对 K 的"解耦小段"做 YaRN 风格扩展</td>
+        <td>DeepSeek-V2/V3</td></tr>
+    <tr><td><strong>Dual-Chunk RoPE</strong></td>
+        <td><code>dual_chunk_rope.py</code></td>
+        <td>把长序列分块，块内用一种 RoPE，块间用另一种</td>
+        <td>ChatGLM-2 等</td></tr>
+    <tr><td><strong>MRoPE</strong>（Multimodal RoPE）</td>
+        <td><code>mrope.py</code></td>
+        <td>把"位置"扩展成 3D 元组 (t, h, w)，分别在不同维度上转</td>
+        <td>Qwen2-VL / 2.5-VL（视频）</td></tr>
+    <tr><td><strong>xDRoPE</strong> / <strong>Llama-4 Vision RoPE</strong> / <strong>ERNIE-4.5 VL RoPE</strong></td>
+        <td><code>xdrope.py</code> / <code>llama4_vision_rope.py</code> / <code>ernie45_vl_rope.py</code></td>
+        <td>各家多模态 / 长上下文的私有变体</td>
+        <td>各自模型</td></tr>
+  </tbody>
+</table>
+
+<p>这些方案都通过<strong>修改 cos_sin_cache 的内容</strong>实现，
+"<em>RoPE 怎么旋转</em>"只与 cache 表的具体数值有关，<strong>下游 attention 代码完全不变</strong>——
+这正是"缓存旋转后 K"那个架构选择带来的红利。</p>
+
+<h2>性能优化：融合内核</h2>
+
+<p>RoPE 本身轻量，但它<strong>夹在 QKV projection 与 attention 之间</strong>，
+每层都要做一次 elementwise pass、读写一遍 Q/K 整张。在 decode 阶段（memory-bound）这是<strong>额外的 HBM 流量</strong>。vLLM 用两类融合压低开销：</p>
+
+<ul>
+  <li><strong>Fused QK-Norm + RoPE</strong>：QwenX、Llama-4 风格在 RoPE 前还会对 Q、K 做一次 RMSNorm，
+    vLLM 把"QKV split → QK norm → RoPE"融成一个 kernel——
+    <code>csrc/fused_qknorm_rope_kernel.cu</code> 与 <code>vllm/compilation/qk_norm_rope_fusion.py</code>。
+    Q/K 只走一遍 HBM。</li>
+  <li><strong>FlashInfer 的 in-place RoPE</strong>：与 attention 同模块的旋转实现，
+    对 head_size ∈ {64, 128, 256, 512} 做了特化。详见 <code>base.py</code> 中的
+    <code>flashinfer_rotary_embedding</code> 自定义算子注册。</li>
+</ul>
+
+<h2>常见陷阱</h2>
+
+<div class="callout warn">
+  <span class="callout-title">"换了 Llama 风格 RoPE，输出全是乱码"</span>
+  <p>多半是 <code>is_neox_style</code> 弄反了。Llama 系列必须 NeoX，
+  某些社区 GGUF 导出可能是 GPT-J 风格。vLLM 会按模型类型自动选，
+  自己改代码时务必两边对齐。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"长上下文模型在 vLLM 里效果不如 HF transformers"</span>
+  <p>大概率是 <code>rope_scaling</code> 配置没被正确读到。检查模型 <code>config.json</code> 是否带
+  <code>rope_scaling = {"type": "yarn", "factor": 4.0, ...}</code> 之类，
+  并在 vLLM 启动日志里搜 "rotary" 看实际生效的实现类。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"自定义模型 head_dim=80 跑不起来"</span>
+  <p>有些 FlashAttention / FlashInfer 后端要求 head_dim ∈ {64,128,256,...}，
+  与 RoPE 不直接相关，但 RoPE 必须 head_dim 偶数（因为要两两配对），
+  奇数 head_dim 直接不合法。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"K 是旋转过的，能直接做 FP8 量化吗？"</span>
+  <p>可以。FP8 KV Cache 量化（<code>--kv-cache-dtype fp8_e4m3</code>）发生在
+  RoPE 之后、写入 cache 之前；解码时反量化回 bf16/fp16 参与 attention。
+  RoPE 的旋转幅值不会让数值范围超出 FP8 表达能力（仍是 ±|K| 量级）。</p>
+</div>
+
+<h2>自查迭代：与其他 Wiki 页对齐</h2>
+
+<p>本页写完后回过头审视已有页面，发现以下需要轻量更新的关联点
+（我已经在对应页加了交叉链接，这里列出供你审查）：</p>
+
+<table>
+  <thead><tr><th>关联页</th><th>关联点</th><th>处理方式</th></tr></thead>
+  <tbody>
+    <tr><td><a href="06-kv-cache.html">KV Cache</a></td>
+        <td>原文未提到"缓存的是 K 旋转后还是旋转前"；这是 RoPE/KV 关系的关键</td>
+        <td>已在 KV Cache 页加入 "Q/K 何时被 RoPE 旋转" 小节并链回本页</td></tr>
+    <tr><td><a href="05-paged-attention.html">PagedAttention</a></td>
+        <td>原文展示的公式 softmax(Q·Kᵀ/√d)·V 隐含 Q、K 已旋转</td>
+        <td>加一句脚注澄清</td></tr>
+    <tr><td><a href="07-continuous-batching.html">连续批处理</a></td>
+        <td>positions 张量与 RoPE 的"按 token 查表"是一体化设计</td>
+        <td>本页已说明，无需修改前页</td></tr>
+    <tr><td><a href="13-multimodal.html">多模态</a></td>
+        <td>Qwen2-VL / 视频模型用 MRoPE 引入 (t,h,w) 三维位置</td>
+        <td>本页表格已覆盖，足够</td></tr>
+    <tr><td><a href="22-glossary.html">术语表</a></td>
+        <td>缺 RoPE、YaRN、NTK、MRoPE 词条</td>
+        <td>建议下次补充（不影响主线）</td></tr>
+  </tbody>
+</table>
+
+<h3>一次"反向核查"</h3>
+<p>再次过本页论述，检查可能的错误或过度简化：</p>
+<ul>
+  <li>✅ "K 是旋转后写入 cache"——源码 <code>llama.py</code> 里
+    <code>q, k = self.rotary_emb(...); self.attn(q, k, v)</code> 已证实，
+    <code>self.attn</code> 内部把已旋转的 k 交给 cache writer。</li>
+  <li>✅ 内积只依赖相对位置——前提是 q、k 用<strong>同一组</strong> R<sub>m</sub>。这点 vLLM 是满足的
+    （同一 RotaryEmbedding 实例同时旋转 q 与 k）。</li>
+  <li>⚠ "几乎不增加显存"——cos_sin_cache 占 <code>max_position × rotary_dim × dtype</code>，
+    对 Llama-3.1 长上下文（max_pos=131072, dim=128, bf16）约 32 MiB。不影响功能但应被知道。</li>
+  <li>⚠ "RoPE 不损推理质量"——前提是<strong>训练与推理使用同一套 base/扩展方案</strong>。
+    擅自给 base 模型套 YaRN 而不微调，会有质量下降。</li>
+  <li>⚠ 本页避开了"为什么 base=10000"的玄学；这是 sinusoidal PE 沿用值，
+    且与 head_dim 配合下覆盖几个数量级位置。这是经验值。</li>
+</ul>
+
+<h2>延伸阅读</h2>
+<ul>
+  <li>Su et al., <em>RoFormer: Enhanced Transformer with Rotary Position Embedding</em>, 2021</li>
+  <li>kaiokendev / Reddit r/LocalLLaMA, NTK-aware scaling, 2023</li>
+  <li>Peng et al., <em>YaRN: Efficient Context Window Extension of Large Language Models</em>, 2023</li>
+  <li>Ding et al., <em>LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens</em>, 2024（Phi-3 long）</li>
+  <li>DeepSeek-AI, <em>DeepSeek-V2 / V3 Technical Report</em>, 2024–2025（MLA + decoupled RoPE）</li>
+  <li>Qwen Team, <em>Qwen2-VL Technical Report</em>, 2024（MRoPE 3D 位置）</li>
+</ul>
+
+<p>下一页：<a href="07-continuous-batching.html">连续批处理 &amp; Chunked Prefill</a>。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

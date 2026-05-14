@@ -19,6 +19,7 @@
 
     { id: "paged-attention",       file: "05-paged-attention.html",       title: "PagedAttention 原理",     group: "核心原理" },
     { id: "kv-cache",              file: "06-kv-cache.html",              title: "KV Cache 与 Prefix Cache",group: "核心原理" },
+    { id: "rope",                  file: "23-rope.html",                  title: "RoPE 旋转位置编码",        group: "核心原理" },
     { id: "continuous-batching",   file: "07-continuous-batching.html",   title: "连续批处理 & Chunked",    group: "核心原理" },
     { id: "scheduler",             file: "08-scheduler.html",             title: "调度器与执行循环",        group: "核心原理" },
 
