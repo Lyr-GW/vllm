@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepSeek V4 与 1M 上下文 — vLLM Wiki</title>
+<meta name="description" content="vLLM Wiki — DeepSeek V4：1M 上下文究竟是什么、CSA/HCA 混合稀疏注意力如何实现、以及与 KV Cache 的具体关系。">
+<link rel="icon" href="../assets/img/logo.svg">
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body data-page="deepseek-v4">
+<div id="header"></div>
+<div class="layout">
+  <div id="sidebar"></div>
+  <div class="main-wrap">
+    <main class="content">
+      <article>
+
+<h1>DeepSeek V4 与 1M 上下文</h1>
+<p class="page-meta"><span>🔬 进阶专题</span><span>· 阅读约 20 分钟</span></p>
+
+<div class="callout info">
+  <span class="callout-title">本页要点</span>
+  <p>DeepSeek 在 <strong>2026 年 4 月 24 日</strong>发布了 <strong>DeepSeek-V4</strong>，两个开源 MoE 变体（V4-Pro 1.6T / V4-Flash 284B）都<strong>原生支持 1M token 上下文</strong>。其核心创新是用 <strong>CSA + HCA 混合稀疏注意力</strong>替代 V3 的 MLA，
+  让 1M 上下文在<strong>显存与算力上都可负担</strong>。本页解答三个问题：</p>
+  <ol>
+    <li>"1M 上下文"指的到底是什么的 1M；</li>
+    <li>怎样在工程上把这个 1M 实现出来；</li>
+    <li>与 <a href="06-kv-cache.html">KV Cache</a>、<a href="23-rope.html">RoPE</a> 的关系。</li>
+  </ol>
+</div>
+
+<h2>"1M 上下文"指什么</h2>
+
+<p>当一个 LLM 声明支持 <em>N</em>-token 上下文，<em>N</em> 是<strong>单次推理时 prompt + 生成结果合计</strong>的最大 token 数。
+对 DeepSeek-V4：</p>
+
+<ul>
+  <li><strong>1,048,576 token</strong>（= 2<sup>20</sup>，约 75 万汉字 / 一本中长篇小说）；</li>
+  <li>是<strong>原生支持</strong>——训练阶段就经过 1M 长上下文的微调，
+    不是靠 YaRN/NTK 等推理期外推硬撑；</li>
+  <li>它是<strong>单个请求的总 token 数上限</strong>，包含：system prompt、user 消息、tool 调用结果、模型已生成的 token。</li>
+</ul>
+
+<p>"1M" 不是指：</p>
+<ul>
+  <li>❌ 训练语料长度（V4 训练涉及的总 token 远超 1M，那叫 dataset size）；</li>
+  <li>❌ 跨请求记忆（vLLM/任何主流引擎都不会跨请求共享 hidden state）；</li>
+  <li>❌ KV Cache 容量（KV 容量由<strong>显存 + 量化 + 压缩</strong>共同决定，1M 是 attention 可看到的窗口）。</li>
+</ul>
+
+<h2>为什么"把 N 调到 1M"这么难</h2>
+
+<p>给一个 LLM 加 1M 上下文，工程上至少撞三堵墙：</p>
+
+<table>
+  <thead><tr><th>瓶颈</th><th>朴素 attention 下的规模</th><th>具体痛点</th></tr></thead>
+  <tbody>
+    <tr><td>Attention 计算复杂度</td><td>O(L<sup>2</sup>) FLOPs</td><td>L=1M → 比 L=128K 多 60× 的 FLOPs，prefill 几小时</td></tr>
+    <tr><td>KV Cache 显存</td><td>O(L) 线性增长</td><td>Llama-3-70B 风格 GQA-8 + bf16，1M token 占 ~160 GB/请求</td></tr>
+    <tr><td>位置编码外推</td><td>RoPE 频率族在训练范围外混乱</td><td>需要 YaRN / 长 RoPE 或重新训练</td></tr>
+  </tbody>
+</table>
+
+<p>DeepSeek-V4 同时解决了前两个：<strong>用稀疏 + 重压缩注意力替代密集 MLA</strong>。
+第三个则靠"训练时直接喂长样本"+ 部分 RoPE 这种工程手段。</p>
+
+<h2>DeepSeek 长上下文技术演化时间线</h2>
+
+<div class="mermaid">
+timeline
+  title DeepSeek 注意力机制演化（关注 KV/长上下文）
+  2024-01 : DeepSeek-V2 引入 MLA\n（KV cache 低秩压缩）
+  2024-12 : DeepSeek-V3 + V3.1\n（MoE 规模化 + MLA 精细化）
+  2025-12 : DeepSeek-V3.2 引入 DSA\n（Lightning Indexer + top-k 稀疏 MLA）
+  2026-04 : DeepSeek-V4 引入 CSA/HCA\n（4× 与 128× 双压缩混合层）
+</div>
+
+<p>从 V2 到 V4，DeepSeek 在 attention 上反复迭代的方向是同一个：
+<strong>不要再让 KV cache 与 attention 计算量随 L 线性增长</strong>。
+理解 V4 之前先快速过 MLA 和 DSA。</p>
+
+<h2>MLA：V2/V3 的低秩 KV 压缩（基石）</h2>
+
+<p>朴素 GQA/MHA 每个 token、每层、每个 KV head 都要存
+<code>(K, V)</code> 共 <code>2·H_kv·d_h</code> 个浮点数。MLA（Multi-head Latent Attention）的做法是：
+<strong>把 KV 投影到一个低维 latent 子空间存起来</strong>，attention 时再上投回原维度。</p>
+
+<pre><code class="language-text">朴素 MHA:    K, V ∈ R^{B × L × H_kv × d_h}
+            KV cache 每 token = 2 · H_kv · d_h · b 字节
+
+MLA (V2/V3): 把 (K, V) 共同压成 latent c_t ∈ R^{r_kv}   (r_kv ≪ H_kv·d_h)
+            KV cache 每 token = r_kv · b 字节
+            attention 前: K_t = W_uk · c_t, V_t = W_uv · c_t
+
+DeepSeek-V3 典型: r_kv ≈ 512, H_kv·d_h ≈ 16384  → 32× 压缩
+                 加 RoPE decoupled 段 (k_R ∈ R^{r_R}, r_R ≈ 64)</code></pre>
+
+<p>关键点：RoPE 不能直接套在 latent 上（旋转矩阵会和 W_uk 缠在一起，破坏共享）。
+V2 的方案是<strong>把 K 分成两段</strong>——非 RoPE 部分走 latent 压缩，RoPE 部分单独保留一小段、
+不压缩、按位置旋转。这是上一页 <a href="23-rope.html">RoPE</a> 里提到过的"DeepSeek decoupled RoPE"。</p>
+
+<p>MLA 把 V3 在 128K 上下文的 KV cache 压到与 Llama-3 GQA-8 相当的水平，
+但<strong>到了 1M 上下文仍然不够</strong>——线性 O(L) 累计起来依旧难承受。</p>
+
+<h2>DSA：V3.2 的稀疏 MLA</h2>
+
+<p>V3.2-Exp (2025-12) 提出 <strong>DeepSeek Sparse Attention (DSA)</strong>：
+不是再压 K/V 本身，而是<strong>让每个 query 只 attend 到 top-k 个最相关的 KV</strong>。</p>
+
+<div class="mermaid">
+flowchart LR
+  Q[Query q_t] --> Idx
+  KVcache[(全 L 个\n压缩 KV)] --> Idx
+  subgraph IdxBlock[Lightning Indexer]
+    Idx[低秩 q/k 投影\n+ LayerNorm + RoPE\n→ 多头点积打分]
+  end
+  Idx --> Top[Top-K=2048\n选择器]
+  Top --> Attn[只对 2048 个 KV\n做完整 attention]
+  Attn --> Out[h_t]
+</div>
+
+<p>关键设计：</p>
+<ul>
+  <li><strong>Lightning Indexer</strong> 是一个轻量的 quasi-attention 头，作用是给"全 L 个 KV 块"打分。
+    它有自己独立的小 K 缓存（<em>indexer K cache</em>），与主 KV cache 分开存储。</li>
+  <li><strong>Top-K=2048</strong> 选择器在 L=128K 下只保留 2048 个最相关 KV——
+    密集 attention 部分就<strong>从 O(L²) 退化为 O(L·2048)</strong>。</li>
+  <li>V3.2 论文报告：128K 上下文下相比密集 MLA，
+    <strong>prefill 成本 3.7×、decode 成本 7.2× 的下降</strong>。</li>
+</ul>
+
+<h2>V4 的核心创新：CSA + HCA 混合注意力</h2>
+
+<p>V4 把 DSA 思路推到了下一步：<strong>不再做"全长 KV cache + 稀疏选择"</strong>，
+而是<strong>从源头就把 KV 沿序列维度压缩</strong>（pooling），然后在压缩后的序列上做注意力——
+有两种压缩等级，交替放在不同层。</p>
+
+<h3>CSA — Compressed Sparse Attention（4× 压缩 + 稀疏）</h3>
+
+<p>核心步骤：</p>
+<ol>
+  <li><strong>软门控池化</strong>（softmax-gated pooling）：在序列维度上用
+    <strong>有重叠的窗口</strong>把每 4 个相邻 token 的 K、V 合成 1 个池化条目；
+    门控权重由 softmax 学出，不是简单 mean pool；</li>
+  <li><strong>Lightning Indexer (FP4 + ReLU 多头点积)</strong>：在已经被 4× 压缩的池上为每个 query 打分；</li>
+  <li>取 <strong>top-k 个压缩块</strong>送入主 attention，做完整的 softmax(QKᵀ)V。</li>
+</ol>
+
+<p>由于稀疏选择前 KV 已经 4× 缩短，搜索空间就小了 4 倍；indexer 跑在更低精度（FP4）也更便宜。
+CSA 层负责<strong>"远距离但仍要保细节"</strong>的依赖。</p>
+
+<h3>HCA — Heavily Compressed Attention（128× 压缩 + 致密）</h3>
+
+<p>HCA 走另一条路：</p>
+<ol>
+  <li><strong>无重叠 128× 池化</strong>：把每 128 个 token 的 K、V 直接合成 1 个池化条目；</li>
+  <li><strong>不需要 indexer</strong>——压缩后序列已经很短（1M token → 仅 ~8K 池化条目），
+    可以承担<strong>致密 attention</strong>；</li>
+  <li>每个 query 与所有压缩条目做完整 softmax(QKᵀ)V。</li>
+</ol>
+
+<p>HCA 是<strong>"全局粗粒度"</strong>通道——它读不了"第 327,891 个 token 是什么字"，
+但能稳稳掌握"这 1M token 的整体语义脉络"。</p>
+
+<h3>三种 attention 的混合编排</h3>
+
+<table>
+  <thead><tr>
+    <th>层类型</th><th>视野</th><th>分辨率</th><th>典型作用</th>
+  </tr></thead>
+  <tbody>
+    <tr><td><strong>Sliding-window full attention</strong></td>
+        <td>本地 <code>sliding_window</code> 长度</td><td>逐 token</td>
+        <td>Bootstrap 层 + 局部细节</td></tr>
+    <tr><td><strong>CSA（4× 压缩，稀疏 top-k）</strong></td>
+        <td>全 1M 上下文</td><td>每 4 token 一块</td>
+        <td>远距离 + 细节兼顾</td></tr>
+    <tr><td><strong>HCA（128× 压缩，致密）</strong></td>
+        <td>全 1M 上下文</td><td>每 128 token 一块</td>
+        <td>全局语义脉络</td></tr>
+  </tbody>
+</table>
+
+<p>这三种 attention 在 V4 的层堆里<strong>交替编排</strong>，每个 token 在不同层得到<strong>多分辨率</strong>的远近混合视野。
+和 wavelet / pyramid 网络的思想同源——但工程上做到 1M 上下文级别。</p>
+
+<h2>V4 的共享组件（所有 attention 层公用）</h2>
+
+<table>
+  <thead><tr><th>组件</th><th>解释</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Shared K=V Multi-Query Attention</strong></td>
+        <td>MQA（只 1 个 KV head），且 <em>K 与 V 用同一组投影</em>——KV cache 再减半</td></tr>
+    <tr><td><strong>Partial RoPE（interleaved-pair）</strong></td>
+        <td>只对 head_dim 的<strong>末尾段</strong>做 RoPE，采用 GPT-J 风格的相邻偶/奇配对（不同于 Llama 的 NeoX 风格）</td></tr>
+    <tr><td><strong>Per-head learnable attention sink</strong></td>
+        <td>每个头有一个可学习的"虚拟 KV 锚点"，借鉴 StreamingLLM 的 sink-token，但学习而非固定</td></tr>
+    <tr><td><strong>Grouped low-rank output projection</strong><br><code>DeepseekV4GroupedLinear</code></td>
+        <td>把 num_heads × d_h → hidden 的稠密 GEMM 拆成 head 组、再过低秩 bottleneck，参数与 FLOPs 都缩</td></tr>
+    <tr><td><strong>Shared sliding-window K=V branch</strong></td>
+        <td>稀疏层旁挂一个 sliding-window 的"快路径"，保 fine-grained 局部能力</td></tr>
+    <tr><td><strong>Manifold-Constrained Hyper-Connections (mHC)</strong></td>
+        <td>用<strong>多条并行残差流</strong> + 双随机矩阵投影替代单一加法残差，缓解 Pre-Norm 在极深网络下的协方差漂移</td></tr>
+    <tr><td><strong>Hash-based MoE bootstrap</strong></td>
+        <td>最前面几层用<strong>固定 token_id → expert_id 哈希查表</strong>，避免初期 router 训练不稳</td></tr>
+  </tbody>
+</table>
+
+<h2>1M 上下文下的实际显存账</h2>
+
+<p>这是用户问"和 KV cache 有什么关系"的直接答案。引用官方与 HuggingFace 博客的数字：</p>
+
+<table>
+  <thead><tr>
+    <th>对照</th><th>1M 上下文 KV cache</th><th>1M 单 token decode FLOPs</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>BF16 GQA-8 baseline（Llama-3 风格 70B 类）</td><td>100% (≈ 几百 GB)</td><td>100%</td></tr>
+    <tr><td>DeepSeek-V3.2 (MLA + DSA)</td><td>~50% 一档</td><td>取决于 top-k</td></tr>
+    <tr><td><strong>DeepSeek-V4-Pro (1.6T MoE)</strong></td>
+        <td><strong>≈10% of V3.2，≈2% of GQA-8 BF16</strong></td>
+        <td>≈27% of V3.2</td></tr>
+    <tr><td><strong>DeepSeek-V4-Flash (284B MoE)</strong></td>
+        <td><strong>≈7% of V3.2</strong></td>
+        <td>≈10% of V3.2</td></tr>
+  </tbody>
+</table>
+
+<p>这个"2%"是怎么来的？把各步压缩链乘起来就清楚：</p>
+
+<pre><code class="language-text">                              cache per token
+GQA-8 BF16   (baseline)        H_kv·d_h·b · 2 = 8 · 128 · 2 · 2 ≈ 4 KB
+MQA (shared K=V)               ÷ 8 (head)  · ½ (K=V 共享) →   ~250 B
+Pool 4× / 128× (CSA / HCA)     再 ÷ 4 ~ 128, 按层加权平均 →   ~80 B
+   ↓
+对 1M token:                  ~80 MB / 请求 / 层
+  ↓ 几十层
+V4-Pro 一个 1M 请求的总 KV    数 GB ~ 十几 GB 量级</code></pre>
+
+<p>对比 BF16 GQA-8 baseline 一个 1M 请求需要几百 GB——根本装不下。
+V4 之所以能把 1M 真正交到用户手上，<strong>本质是把"每 token 缓存几 KB"压到"每 token 缓存几十字节"</strong>，
+而压缩点是 <em>多个</em>：MQA、共享 K=V、池化、低 bit。</p>
+
+<div class="callout success">
+  <span class="callout-title">用一句话总结</span>
+  <p>V4 的 1M 上下文 <strong>不是靠"扩大 KV cache"</strong>，恰恰相反——是靠
+  <strong>"用更少的 KV 表达更长的上下文"</strong>。CSA/HCA 让 attention 在<em>压缩后的、更短的</em> KV 流上运作，
+  KV cache 物理大小与 1M 上下文之间不再是线性关系。</p>
+</div>
+
+<h2>与 RoPE / Prefix Caching 的相互作用</h2>
+
+<h3>RoPE 部分</h3>
+<ul>
+  <li>V4 用 <strong>partial RoPE（interleaved-pair = GPT-J 风格）</strong>，只对每个 head 的末尾若干维度旋转——
+    这与 Llama / Qwen 默认的 NeoX 风格不同；vLLM 加载 V4 时会按模型 config 选对
+    <code>is_neox_style=False</code>（详见 <a href="23-rope.html">RoPE 页</a>）。</li>
+  <li>因为 KV 在写入缓存前要先池化、再做或不做 RoPE，旋转操作的"应用点"会和 V3 不同——
+    池化后的代表 token 才被赋予位置，而不是逐 raw token 旋转后再池化。</li>
+</ul>
+
+<h3>Prefix Caching 部分</h3>
+<ul>
+  <li>vLLM 的 <a href="06-kv-cache.html">Prefix Cache</a> 按 token 块哈希。
+    V4 的"4× / 128× 池化 + 软门控"意味着<strong>同一段 prefix 在不同后文里池化结果可能不同</strong>
+    （重叠窗口的 softmax 门控对邻居敏感），尤其 CSA 层。
+    所以严格意义上 V4 上"前缀复用"的命中粒度变小——这是 1M 上下文的代价之一。</li>
+  <li>HCA 层（无重叠 128× 池化）受影响更小，因为同一段 token 在窗口对齐时池化结果是确定的。</li>
+</ul>
+
+<h2>在 vLLM 中部署 V4</h2>
+
+<p>截至本页撰写时，HuggingFace transformers 已合入 V4 支持
+（<code>docs/source/en/model_doc/deepseek_v4.md</code>），vLLM 通过 transformers backend 跟进。
+启动参数会和 V3 类似，但要注意：</p>
+
+<pre><code class="language-bash">vllm serve deepseek-ai/DeepSeek-V4-Flash \
+  --tensor-parallel-size 8 \
+  --max-model-len 1048576 \
+  --gpu-memory-utilization 0.92 \
+  --kv-cache-dtype fp8_e4m3 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill</code></pre>
+
+<p>要点：</p>
+<ul>
+  <li><strong>必须开 chunked prefill</strong>——否则一条 1M prompt 一次性 prefill 会霸占整个 GPU 几十分钟。
+    建议同时调大 <code>--max-num-batched-tokens</code>（如 32768）让 chunk 不至于过碎；</li>
+  <li><strong>KV 量化叠加</strong>：V4 自身已经做了序列维度压缩，KV bit 量化（fp8）仍可叠加再降 2×；</li>
+  <li><strong>显存仍要预留</strong>：即便 V4-Flash 在 1M 下 KV ≈ 7% of V3.2，单请求也要几 GB；
+    并发若干条 1M 时合计仍可观；</li>
+  <li><strong>抢占 / Swap</strong>：对 1M 请求几乎从不该走 Swap（IO 时长不可接受），
+    应优先用 Recompute + Prefix Cache 命中尽量减少重做。</li>
+</ul>
+
+<h2>常见误区</h2>
+
+<div class="callout warn">
+  <span class="callout-title">"1M = 可以塞 1M 后端无影响"</span>
+  <p>错。即使 KV 大幅压缩，<strong>indexer + 池化 + 多层 GEMM</strong> 在 1M 长度下仍是几十秒 ~ 几分钟的 prefill。
+  TTFT 与 1M 几乎线性。HCA 的优势是<strong>每 token decode 时间</strong>，
+  不是 prefill 时间。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"V4 取代了 MLA"</span>
+  <p>V4 的 paper / blog 描述里，CSA / HCA <strong>本身仍是 MLA 系下的变体</strong>——
+  KV 在通道维度仍走低秩 latent，只是再叠加了<strong>序列维度的池化</strong>与稀疏选择。
+  把它理解为"序列维稀疏 + 通道维低秩 + MQA + 共享 K=V"四件套同时启用更准确。</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">"V4 出来后 V3.2 的 DSA 就过时了"</span>
+  <p>不见得。DSA 不池化原始 KV、不丢失逐 token 分辨率，
+  对"需要精确逐 token 检索"的任务（精确 quote、代码逐字 reference）依旧有价值；
+  V4 用更激进的池化换更长的上下文，是另一种权衡。</p>
+</div>
+
+<h2>"1M 上下文 ≠ 1M 个 token 都同等重要"</h2>
+
+<p>V4 的 CSA/HCA 隐含一个工程信念：<strong>1M 个 token 中真正需要"逐字精确召回"的是少数</strong>。
+对绝大多数 agentic 工作流（长会话、工具调用日志、检索文档）来说：</p>
+
+<ul>
+  <li>近端几千 token 需要逐字精确（→ sliding-window full attention 处理）；</li>
+  <li>中端十万级 token 需要细节但不必逐字（→ CSA 4× 压缩 + top-k）；</li>
+  <li>远端百万级 token 需要"知道有这事 + 大致意思"（→ HCA 128× 致密压缩）。</li>
+</ul>
+
+<p>这种"按距离分配带宽"的设计哲学，与<strong>人类记忆的层次</strong>非常像。
+长上下文 LLM 从此从 "用更大的 KV cache" 转向 "用更聪明的 KV cache"。</p>
+
+<h2>延伸阅读</h2>
+<ul>
+  <li>DeepSeek-AI, <em>DeepSeek-V4: Compressed Sparse Attention and Heavily Compressed Attention Enable One-Million-Token Contexts</em>, HuggingFace blog, 2026-04-24</li>
+  <li>DeepSeek-AI, <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>, arXiv:2512.02556, 2025</li>
+  <li>DeepSeek-AI, <em>DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model</em>, 2024（MLA 原始提案）</li>
+  <li>HuggingFace transformers, <code>docs/source/en/model_doc/deepseek_v4.md</code></li>
+  <li>Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023（attention sink 概念来源）</li>
+  <li>Beltagy et al., <em>Longformer: The Long-Document Transformer</em>, 2020（sliding window 注意力先驱）</li>
+</ul>
+
+<p>相关：<a href="06-kv-cache.html">KV Cache 与 Prefix Caching</a>、
+<a href="23-rope.html">RoPE 旋转位置编码</a>、
+<a href="10-parallelism.html">分布式与并行</a>。</p>
+
+      </article>
+      <div id="prev-next"></div>
+    </main>
+    <aside class="toc"><h4>本页目录</h4><ul></ul></aside>
+  </div>
+</div>
+<div id="footer"></div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/search.js"></script>
+</body>
+</html>

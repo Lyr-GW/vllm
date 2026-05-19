@@ -142,5 +142,11 @@
     "url": "pages/23-rope.html",
     "summary": "RoPE 的数学直觉、频率族设计、NeoX/GPT-J 两种风格、与 KV Cache 的协作、YaRN / NTK / Llama-3 / Phi-3 长上下文扩展，以及 vLLM 实现走查。",
     "keywords": ["rope", "rotary position embedding", "旋转位置编码", "位置编码", "kv cache", "yarn", "ntk", "ntk-aware", "dynamic ntk", "long rope", "mrope", "neox", "gpt-j", "frequency", "theta", "cos_sin_cache", "pos_encoding_kernels", "apply_rotary_emb", "rotate_half"]
+  },
+  {
+    "title": "DeepSeek V4 与 1M 上下文",
+    "url": "pages/24-deepseek-v4.html",
+    "summary": "1M 上下文究竟指什么、为什么传统 attention 撑不住，以及 DeepSeek 从 MLA → DSA → CSA/HCA 的演化怎样把 1M 上下文做成可负担。",
+    "keywords": ["deepseek", "deepseek v4", "deepseek-v4", "1m context", "百万上下文", "长上下文", "mla", "multi-head latent attention", "dsa", "deepseek sparse attention", "csa", "compressed sparse attention", "hca", "heavily compressed attention", "lightning indexer", "稀疏注意力", "sparse attention", "kv cache compression", "mqa", "v4-pro", "v4-flash", "mhc", "manifold-constrained hyper-connections", "attention sink"]
   }
 ]

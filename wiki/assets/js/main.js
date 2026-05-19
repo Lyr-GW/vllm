@@ -39,6 +39,8 @@
     { id: "contributing",          file: "20-contributing.html",          title: "贡献指南",                group: "参考" },
     { id: "faq",                   file: "21-faq.html",                   title: "常见问答 FAQ",            group: "参考" },
     { id: "glossary",              file: "22-glossary.html",              title: "术语表",                  group: "参考" },
+
+    { id: "deepseek-v4",           file: "24-deepseek-v4.html",           title: "DeepSeek V4 与 1M 上下文", group: "进阶专题" },
   ];
 
   function isUnderPages() {

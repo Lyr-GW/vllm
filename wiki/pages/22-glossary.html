@@ -138,6 +138,27 @@
   <dt><strong>MRoPE</strong> (Multimodal RoPE)</dt>
   <dd>把位置从标量扩成 (t, h, w) 三维元组，用于视频 / 图像 token，Qwen2-VL 等采用。</dd>
 
+  <dt><strong>MLA</strong> (Multi-head Latent Attention)</dt>
+  <dd>DeepSeek-V2 引入的 KV 通道维低秩压缩：把 (K, V) 共同投影到一个 latent 子空间存储，
+    解决 KV cache 显存膨胀。详见 <a href="24-deepseek-v4.html">DeepSeek V4 与 1M 上下文</a>。</dd>
+
+  <dt><strong>DSA</strong> (DeepSeek Sparse Attention)</dt>
+  <dd>V3.2 引入：Lightning Indexer + Top-K=2048 选择，对 MLA 缓存做稀疏访问。</dd>
+
+  <dt><strong>CSA / HCA</strong> (Compressed Sparse / Heavily Compressed Attention)</dt>
+  <dd>V4 引入：CSA 把 KV 在序列维做 4× 软门控池化 + 稀疏 top-k；HCA 做 128× 致密池化。
+    交替组成 V4 的 1M 上下文层堆。</dd>
+
+  <dt><strong>Lightning Indexer</strong></dt>
+  <dd>DeepSeek DSA/CSA 的轻量打分器：FP4 + ReLU 多头点积，独立小 K 缓存，
+    用以为每个 query 选出最相关的 KV 块。</dd>
+
+  <dt><strong>mHC</strong> (Manifold-Constrained Hyper-Connections)</dt>
+  <dd>V4 引入的"多流并行残差"，替代传统 Pre-Norm 单加残差，缓解极深网络协方差漂移。</dd>
+
+  <dt><strong>Attention Sink</strong></dt>
+  <dd>StreamingLLM 提出的"虚拟初始 token"，让远端注意力分数有处可去；V4 把它变为<em>每头可学</em>。</dd>
+
   <dt><strong>PP</strong> (Pipeline Parallelism)</dt>
   <dd>把不同层放到不同设备形成流水线。</dd>
 
